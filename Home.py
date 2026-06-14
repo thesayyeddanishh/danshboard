@@ -49,12 +49,17 @@ def process_upload(uploaded_file):
             
             if not result["success"]:
                 st.error(result["error"])
-                st.session_state.pop('data_df', None)
+                # Reset the store if upload fails
+                st.session_state['store']['data_df'] = None
                 return False
             else:
-                st.session_state['data_df'] = result["df"]
-                st.session_state['file_name'] = uploaded_file.name
-                st.success(f"Data uploaded successfully! File: {uploaded_file.name}. Please select a dashboard from the sidebar.")
+                # 🔥 FIX: Save into the 'store' dictionary, not the root session_state
+                st.session_state['store']['data_df'] = result["df"]
+                st.session_state['store']['file_name'] = uploaded_file.name
+                # Also save the format here so it's guaranteed to be in the store
+                st.session_state['store']['format'] = st.session_state['global_format_selection']
+                
+                st.success(f"Data uploaded successfully! File: {uploaded_file.name}.")
                 return True
         except Exception as e:
             st.error(f"Error reading file: {e}")
