@@ -62,17 +62,23 @@ def process_upload(uploaded_file):
     return False
 
 # ==========================================
+# ==========================================
 # MAIN PAGE UI
 # ==========================================
 st.title("🦅 Hawkeye Master Hub")
 
 # 1. MANDATORY FORMAT SELECTION
 st.markdown("### Step 1: Select Format")
+
+# Change the widget key name to a temporary widget key
 selected_format = st.selectbox(
     "Choose the Match Format & Ruleset:",
     options=list(FORMAT_CONFIG.keys()),
-    key="global_format_selection"
+    key="format_widget_temp" 
 )
+
+# 🔥 FIX: Copy the value to a permanent, non-widget key so it survives page changes!
+st.session_state['global_format_selection'] = selected_format
 
 # Show what ball type was registered by the "Brain"
 ball_type = FORMAT_CONFIG[selected_format]["ball_type"]
