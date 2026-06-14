@@ -140,7 +140,7 @@ def create_crease_beehive(df_in, delivery_type, ball_type):
     # Coloring metric depends on ball type
     color_metric = summary["SR"] if ball_type == "White" else summary["Avg"]
     max_val = color_metric.max() if color_metric.max() > 0 else (200 if ball_type == "White" else 100)
-    norm = mcolors.Normalize(vmin=0, vmax=max_val)
+    norm = matplotlib.colors.Normalize(vmin=0, vmax=max_val)
     cmap = plt.get_cmap('Wistia')
 
     for index, row in summary.iterrows():
