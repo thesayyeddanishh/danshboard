@@ -2,58 +2,51 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 import sys
 import os
 
-# Ensure the app can find the brain file
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from cricket_rules import FORMAT_CONFIG
 
-# ==========================================
-# 1. INITIAL STATE CHECKS & BRAIN LOADING
-# ==========================================
-if 'data_df' not in st.session_state or 'global_format_selection' not in st.session_state:
+# Guardrail check reads directly from our protected shield dictionary
+if 'store' not in st.session_state or st.session_state['store']['data_df'] is None:
     st.warning("⚠️ No dataset detected. Please go to the **Home Page**, select your format, and upload your CSV first.")
     st.stop()
 
-# Load Data and Settings
-df_raw = st.session_state['data_df'].copy()
-active_format = st.session_state['global_format_selection']
+# Extract data cleanly from the shield
+df_raw = st.session_state['store']['data_df'].copy()
+active_format = st.session_state['store']['format']
 speed_unit = st.session_state.get('speed_unit_preference', 'KPH')
 
-# Fetch the specific rules for this format from the Brain
 rules = FORMAT_CONFIG[active_format]
 BALL_TYPE = rules["ball_type"]
 SEAM_BINS = rules["seam_bins"]
 SPIN_BINS = rules["spin_bins"]
 
 st.markdown(f"## 🏏 Batters Analysis ({active_format})")
-st.markdown(f"**Metrics Mode:** `{BALL_TYPE} Ball` | **Speed Unit:** `{speed_unit}`")
 
-# ==========================================
-# 2. DYNAMIC MULTI-SELECT FILTERS
-# ==========================================
+# --- UPDATE FILTER SECTION: ADD EXPLICIT KEYS TO THE MULTISELECT WIDGETS ---
 filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
 
-# Multi-select functions (defaulting to all if empty)
 with filter_col1:
     tours = df_raw["Tour"].dropna().unique().tolist()
-    sel_tours = st.multiselect("Tour(s)", options=tours, default=tours)
+    # Added explicit unique key
+    sel_tours = st.multiselect("Tour(s)", options=tours, default=tours, key="batters_tour_filter")
 
 with filter_col2:
     matches = df_raw[df_raw["Tour"].isin(sel_tours)]["Match"].dropna().unique().tolist() if sel_tours else df_raw["Match"].dropna().unique().tolist()
-    sel_matches = st.multiselect("Match(es)", options=matches, default=matches)
+    # Added explicit unique key
+    sel_matches = st.multiselect("Match(es)", options=matches, default=matches, key="batters_match_filter")
 
 with filter_col3:
     teams = df_raw["BattingTeam"].dropna().unique().tolist()
-    sel_teams = st.multiselect("Batting Team(s)", options=teams, default=teams)
+    # Added explicit unique key
+    sel_teams = st.multiselect("Batting Team(s)", options=teams, default=teams, key="batters_team_filter")
 
 with filter_col4:
     batsmen = df_raw[df_raw["BattingTeam"].isin(sel_teams)]["BatsmanName"].dropna().unique().tolist() if sel_teams else df_raw["BatsmanName"].dropna().unique().tolist()
-    sel_batsmen = st.multiselect("Batsman Name(s)", options=batsmen)
+    # Added explicit unique key
+    sel_batsmen = st.multiselect("Batsman Name(s)", options=batsmen, key="batters_batsman_filter")
 
 # Apply Filters
 df_filtered = df_raw.copy()
