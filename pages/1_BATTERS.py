@@ -5,17 +5,19 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
+# Ensure the app can find the brain file
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from cricket_rules import FORMAT_CONFIG
 
-# Guardrail check reads directly from our protected shield dictionary
-if 'store' not in st.session_state or st.session_state['store']['data_df'] is None:
+# --- FIX: THE CORRECT GATEKEEPER ---
+# We check 'store' AND if the 'data_df' inside it is not None
+if 'store' not in st.session_state or st.session_state['store'].get('data_df') is None:
     st.warning("⚠️ No dataset detected. Please go to the **Home Page**, select your format, and upload your CSV first.")
     st.stop()
 
-# Extract data cleanly from the shield
+# Load Data and Settings from the shielded store
 df_raw = st.session_state['store']['data_df'].copy()
-active_format = st.session_state['store']['format']
+active_format = st.session_state['store'].get('format', 'T20') # Default fallback
 speed_unit = st.session_state.get('speed_unit_preference', 'KPH')
 
 rules = FORMAT_CONFIG[active_format]
