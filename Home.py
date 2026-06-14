@@ -61,6 +61,13 @@ def process_upload(uploaded_file):
             return False
     return False
 
+if 'store' not in st.session_state:
+    st.session_state['store'] = {
+        'data_df': None,
+        'format': None,
+        'file_name': None
+    }
+
 # ==========================================
 # ==========================================
 # MAIN PAGE UI
