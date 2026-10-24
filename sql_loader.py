@@ -98,8 +98,8 @@ class _Bad(Exception):
 
 def newline_stats(data: bytes):
     """Return (CRLF pairs, standalone LF bytes) without decoding the archive."""
-    crlf = data.count(b"\\r\\n")
-    lone_lf = len(re.findall(rb"(?<!\\r)\\n", data))
+    crlf = data.count(b"\r\n")
+    lone_lf = len(re.findall(rb"(?<!\r)\n", data))
     return crlf, lone_lf
 
 
@@ -110,7 +110,7 @@ def _normalise_text_mode_dump(data: bytes) -> Optional[bytes]:
     crlf, lone_lf = newline_stats(data)
     if crlf < 50 or lone_lf != 0:
         return None
-    candidate = data.replace(b"\\r\\n", b"\\n")
+    candidate = data.replace(b"\r\n", b"\n")
     return candidate if candidate != data else None
 
 
