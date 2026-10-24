@@ -88,11 +88,38 @@ FINAL_COLS = [
     "DeliveryType", "Swing", "Ground", "Tour", "Year", "Match", "Country",
 ]
 
-CORRUPTION_HINT = (
-    "The file looks damaged. This usually happens when a binary dump is "
-    "transferred in text mode (every newline byte gets turned into CRLF). "
-    "Re-export it with `pg_dump -Fc`, or zip it, and upload the original file."
-)
+class _Bad(Exception):
+    """Internal: a structural problem found while reading the archive."""
+
+    def __init__(self, where: str, detail: str):
+        super().__init__(f"{where}: {detail}")
+        self.where, self.detail = where, detail
+
+
+def newline_stats(data: bytes):
+    """(CRLF pairs, standalone LF bytes). A binary dump normally has plenty of
+    standalone LF bytes; a file whose newlines were converted has none."""
+    crlf = data.count(b"\r\n")
+    lone_lf = len(re.findall(rb"(?<!\r)\n", data))
+    return crlf, lone_lf
+
+
+def _explain(data: bytes, err: "_Bad", version: str = "") -> str:
+    crlf, lone_lf = newline_stats(data)
+    if crlf >= 50 and lone_lf == 0:
+        return (
+            f"The file was damaged before it reached the dashboard: it contains "
+            f"{crlf:,} CRLF pairs and no standalone newline bytes, so every newline "
+            "byte in the binary dump was converted to CRLF (a text-mode transfer, e.g. "
+            "`pg_dump ... > file` in Windows PowerShell/cmd). Re-export with "
+            "`pg_dump -Fc -f file.dump ...` and upload that file."
+        )
+    ver = f" (dump format {version})" if version else ""
+    return (
+        f"The dump could not be read{ver}: {err.where} - {err.detail}. "
+        "The file does not look newline-damaged, so this may be a dump variant "
+        "this loader does not handle yet."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -106,13 +133,15 @@ class _Buf:
         self.off_size = 8
 
     def byte(self) -> int:
+        if self.pos >= len(self.data):
+            raise _Bad("unexpected end of file", f"at byte {self.pos:,}")
         b = self.data[self.pos]
         self.pos += 1
         return b
 
     def read(self, n: int) -> bytes:
         if n < 0 or self.pos + n > len(self.data):
-            raise DumpReadError(CORRUPTION_HINT)
+            raise _Bad("bad length field", f"{n:,} bytes requested at byte {self.pos:,}")
         out = self.data[self.pos : self.pos + n]
         self.pos += n
         return out
@@ -178,7 +207,7 @@ def _parse_toc(buf: _Buf) -> _Toc:
     buf.string()  # pg_dump version
     count = buf.int()
     if not 0 < count < 1_000_000:
-        raise DumpReadError(CORRUPTION_HINT)
+        raise _Bad("table of contents", f"implausible entry count {count}")
     for _ in range(count):
         e = {}
         e["id"] = buf.int()
@@ -208,11 +237,14 @@ def _parse_toc(buf: _Buf) -> _Toc:
 
 
 def _read_block(buf: _Buf, toc: _Toc, entry: dict, pos: int) -> bytes:
+    where = f"table {entry['tag']}"
     buf.pos = pos
-    if buf.byte() != 1:  # BLK_DATA
-        raise DumpReadError(CORRUPTION_HINT)
-    if buf.int() != entry["id"]:
-        raise DumpReadError(CORRUPTION_HINT)
+    kind = buf.byte()
+    if kind != 1:  # BLK_DATA
+        raise _Bad(where, f"no data block at offset {pos:,} (found type {kind})")
+    found = buf.int()
+    if found != entry["id"]:
+        raise _Bad(where, f"data block id {found} does not match table of contents id {entry['id']}")
     d = zlib.decompressobj() if toc.compressed else None
     parts = []
     while True:
@@ -224,11 +256,11 @@ def _read_block(buf: _Buf, toc: _Toc, entry: dict, pos: int) -> bytes:
             try:
                 parts.append(d.decompress(chunk))
             except zlib.error as exc:
-                raise DumpReadError(CORRUPTION_HINT) from exc
+                raise _Bad(where, f"compressed data is corrupt ({exc})") from exc
         else:
             parts.append(chunk)
     if d is not None and not d.eof:
-        raise DumpReadError(CORRUPTION_HINT)
+        raise _Bad(where, "compressed data ends unexpectedly")
     return b"".join(parts)
 
 
@@ -419,19 +451,32 @@ def build_dashboard_df(t: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
     """Parse the dump and return the needed tables as DataFrames of strings."""
+    version = ""
     try:
         buf = _Buf(data)
         toc = _parse_toc(buf)
+        version = ".".join(str(v) for v in toc.version)
         blocks = _table_blocks(buf, toc, list(TABLE_COLUMNS))
-        entries = {e["tag"]: e for e in toc.entries if e["desc"] == "TABLE DATA"}
-        return {
-            name: _copy_to_df(blocks[name], _copy_columns(entries[name]), cols)
-            for name, cols in TABLE_COLUMNS.items()
-        }
-    except DumpReadError:
-        raise
+    except _Bad as err:
+        raise DumpReadError(_explain(data, err, version)) from err
     except (IndexError, ValueError, struct.error) as exc:
-        raise DumpReadError(CORRUPTION_HINT) from exc
+        raise DumpReadError(
+            _explain(data, _Bad("archive structure", repr(exc)), version)
+        ) from exc
+
+    entries = {e["tag"]: e for e in toc.entries if e["desc"] == "TABLE DATA"}
+    out: Dict[str, pd.DataFrame] = {}
+    for name, cols in TABLE_COLUMNS.items():
+        try:
+            out[name] = _copy_to_df(blocks[name], _copy_columns(entries[name]), cols)
+        except DumpReadError:
+            raise
+        except Exception as exc:  # pandas parsing problems etc.
+            raise DumpReadError(
+                f"Could not parse the data of table {name} (dump format {version}): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    return out
 
 
 def load_dashboard_df(data: bytes) -> pd.DataFrame:
