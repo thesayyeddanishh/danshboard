@@ -1,113 +1,184 @@
-# Home.py
+"""
+Consolidated VR Story Assistant
+Run from this folder:
+  streamlit run Home.py
+"""
+from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
-import io
-from cricket_rules import FORMAT_CONFIG
+from io import StringIO
+
+from cricket_config import FORMAT_KEYS, FORMAT_LABELS, resolve_format
+from sql_loader import DumpReadError, load_dashboard_df
 
 REQUIRED_COLS = [
-    "BatsmanName", "DeliveryType", "Wicket", "StumpsY", "StumpsZ", 
-    "BattingTeam", "CreaseY", "CreaseZ", "Runs", "IsBatsmanRightHanded", 
-    "LandingX", "LandingY", "BounceX", "BounceY", "InterceptionX", 
-    "InterceptionZ", "InterceptionY", "Over"
+    "Innings",
+    "Over",
+    "Ball",
+    "BatsmanName",
+    "BowlerName",
+    "BowlingTeam",
+    "BattingTeam",
+    "IsBowlerRightHanded",
+    "IsBatsmanRightHanded",
+    "Wicket",
+    "Runs",
+    "ReleaseY",
+    "ReleaseZ",
+    "ReleaseSpeed",
+    "Deviation",
+    "Swing",
+    "DeliveryType",
+    "StumpsY",
+    "StumpsZ",
+    "CreaseY",
+    "CreaseZ",
+    "LandingX",
+    "LandingY",
+    "BounceX",
+    "BounceY",
+    "InterceptionX",
+    "InterceptionZ",
+    "InterceptionY",
+    "Ground",
+    "Tour",
+    "Year",
+    "Match"
 ]
 
-st.set_page_config(layout="wide", page_title="VR Story Assistant", page_icon="hawk-logo.png")
-
-# --- Custom CSS ---
-st.markdown("<style>section[data-testid='stSidebar'] { width: 220px !important; }</style>", unsafe_allow_html=True)
-
-with st.sidebar:
-    st.markdown("### 🛠️ App Administration")
-    if st.button("🔄 Clear App Cache & Reload"):
-        st.cache_data.clear() 
-        st.success("Cache Cleared Successfully!")
-        st.rerun()
-
-@st.cache_data(ttl=900, show_spinner="Processing raw performance dataset...")
-def load_and_validate_csv(file_bytes):
-    df_raw = pd.read_csv(io.BytesIO(file_bytes))
-        
-    missing_cols = [col for col in REQUIRED_COLS if col not in df_raw.columns]
-    if missing_cols:
-        return {"success": False, "error": f"Missing required columns: {', '.join(missing_cols)}"}
-    
-    # === GLOBAL FIX: FORCE UPPERCASE ON ALL NAMES ===
-    if "BatsmanName" in df_raw.columns:
-        df_raw["BatsmanName"] = df_raw["BatsmanName"].astype(str).str.upper()
-    if "BowlerName" in df_raw.columns:
-        df_raw["BowlerName"] = df_raw["BowlerName"].astype(str).str.upper()
-    if "BattingTeam" in df_raw.columns:
-        df_raw["BattingTeam"] = df_raw["BattingTeam"].astype(str).str.upper()
-        
-    return {"success": True, "df": df_raw}
-
-def process_upload(uploaded_file):
-    if uploaded_file is not None:
-        try:
-            file_bytes = uploaded_file.getvalue()
-            result = load_and_validate_csv(file_bytes)
-            
-            if not result["success"]:
-                st.error(result["error"])
-                # Reset the store if upload fails
-                st.session_state['store']['data_df'] = None
-                return False
-            else:
-                # 🔥 FIX: Save into the 'store' dictionary, not the root session_state
-                st.session_state['store']['data_df'] = result["df"]
-                st.session_state['store']['file_name'] = uploaded_file.name
-                # Also save the format here so it's guaranteed to be in the store
-                st.session_state['store']['format'] = st.session_state['global_format_selection']
-                
-                st.success(f"Data uploaded successfully! File: {uploaded_file.name}.")
-                return True
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
-            return False
-    return False
-
-if 'store' not in st.session_state:
-    st.session_state['store'] = {
-        'data_df': None,
-        'format': None,
-        'file_name': None
-    }
-
-# ==========================================
-# ==========================================
-# MAIN PAGE UI
-# ==========================================
-st.title("🦅 Hawkeye Master Hub")
-
-# 1. MANDATORY FORMAT SELECTION
-st.markdown("### Step 1: Select Format")
-
-# Change the widget key name to a temporary widget key
-selected_format = st.selectbox(
-    "Choose the Match Format & Ruleset:",
-    options=list(FORMAT_CONFIG.keys()),
-    key="format_widget_temp" 
+st.set_page_config(
+    page_title="VR DANshboard", 
+    page_icon="hawk-logo.png",
+    layout="wide"
 )
 
-# 🔥 FIX: Copy the value to a permanent, non-widget key so it survives page changes!
-st.session_state['global_format_selection'] = selected_format
+st.markdown(
+    """
+    <style>
+    section[data-testid="stSidebar"] {
+        width: 200px !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Show what ball type was registered by the "Brain"
-ball_type = FORMAT_CONFIG[selected_format]["ball_type"]
-st.info(f"Loaded rules for **{selected_format}** ({ball_type} Ball Metrics Active).")
+def process_upload(uploaded_file, source: str = "csv") -> bool:
+    if uploaded_file is None:
+        return False
+    try:
+        if source == "sql":
+            with st.spinner("Reading SQL dump..."):
+                df_raw = load_dashboard_df(uploaded_file.getvalue())
+        else:
+            data = uploaded_file.getvalue().decode("utf-8")
+            df_raw = pd.read_csv(StringIO(data))
+        if not all(col in df_raw.columns for col in REQUIRED_COLS):
+            missing = [c for c in REQUIRED_COLS if c not in df_raw.columns]
+            label = "SQL dump" if source == "sql" else "CSV file"
+            st.error(f"The {label} is missing required columns: {', '.join(missing)}")
+            st.session_state.pop("data_df", None)
+            st.session_state.pop("file_name", None)
+            return False
+        st.session_state["data_df"] = df_raw
+        st.session_state["file_name"] = uploaded_file.name
+        st.session_state["data_source"] = source
+        if "initial_load_complete" in st.session_state:
+            st.success(f"Data successfully replaced!\n Total deliveries loaded: {len(df_raw):,}.")
+        else:
+            st.session_state["initial_load_complete"] = True
+            st.success(
+                f"Data uploaded successfully! File: {uploaded_file.name}. "
+                "Use the sidebar pages: Batters, Pacers, Spinners, Leaderboard."
+            )
+        return True
+    except DumpReadError as e:
+        st.error(str(e))
+        st.session_state.pop("data_df", None)
+        st.session_state.pop("file_name", None)
+        return False
+    except Exception as e:
+        st.error(f"Error reading file: {e}")
+        st.session_state.pop("data_df", None)
+        st.session_state.pop("file_name", None)
+        return False
 
-# 2. DATA UPLOAD
-st.markdown("### Step 2: Upload Data")
-uploaded_file = st.file_uploader("Upload your tracking CSV file here", type=["csv"], key="main_uploader")
+st.title("VR Story Assistant")
+fmt_labels = [FORMAT_LABELS[k] for k in FORMAT_KEYS]
+default_key = st.session_state.get("cricket_format", "men_t20i")
+default_idx = FORMAT_KEYS.index(default_key) if default_key in FORMAT_KEYS else 0
+c1, c2 = st.columns([3, 1])
+with c1:
+    choice = st.selectbox("Format", fmt_labels, index=default_idx, key="format_select_main")
+with c2:
+    _saved_unit = st.session_state.get("speed_unit", "kph")
+    _unit_default = "MPH" if _saved_unit == "mph" else "KPH"
+    unit_choice = st.segmented_control(
+        "Speed Unit", ["KPH", "MPH"], default=_unit_default, key="speed_unit_select"
+    )
+st.session_state["cricket_format"] = FORMAT_KEYS[fmt_labels.index(choice)]
+st.session_state["speed_unit"] = (unit_choice or _unit_default).lower()
+_cfg = resolve_format(st.session_state["cricket_format"])
+
+st.subheader("2. Upload CSV or SQL dump")
+source_choice = st.radio("Data source", ["CSV", "SQL dump"], horizontal=True, key="source_select")
+source_key = "sql" if source_choice == "SQL dump" else "csv"
+
+if source_key == "csv":
+    with st.expander("Required CSV columns when exporting from CDS"):
+        st.markdown(
+            """
+* **General:** `Innings`, `Over`, `Ball`, `BowlerName`, `BatsmanName`, `BowlingTeam`, `BattingTeam`
+* **Handedness:** `IsBowlerRightHanded`, `IsBatsmanRightHanded`
+* **Results:** `Wicket`, `Runs`
+* **Coordinates:** `Bounce X Y`, `Interception X Y Z`, `Crease Y Z`, `Stumps Y Z`, `Release Y Z`, `Landing X Y`
+* **Delivery:** `DeliveryType`, `ReleaseSpeed`, `Deviation`, `Swing`
+* **Match:** `Ground`, `Tour`, `Year`, `Match`
+            """
+        )
+    uploaded_file = st.file_uploader("Upload your CSV file here", type=["csv"], key="main_uploader")
+else:
+    with st.expander("SQL dump requirements"):
+        st.markdown(
+            """
+Upload a PostgreSQL dump of the Hawk-Eye `cricketdatabase` made with `pg_dump -Fc`
+(custom format). All the required dashboard columns are built automatically from the
+database tables, so the result is identical to a CSV export. Plain-text `.sql` files are not supported.
+            """
+        )
+    uploaded_file = st.file_uploader(
+        "Upload your SQL dump here", type=["sql", "dump", "backup"], key="sql_uploader"
+    )
 
 if uploaded_file is not None:
-    if 'data_df' not in st.session_state or uploaded_file.name != st.session_state.get('file_name'):
-        process_upload(uploaded_file)
+    if "data_df" not in st.session_state or uploaded_file.name != st.session_state.get("file_name"):
+        process_upload(uploaded_file, source_key)
+      
+st.write("Wait for the next line to turn blue after uploading")
 
-# 3. SPEED UNIT PREFERENCE
-st.markdown("---")
-st.radio("Select Speed Metric Display Unit:", options=["KPH", "MPH"], index=0, horizontal=True, key="speed_unit_preference")
+if "data_df" in st.session_state:
+    df_loaded = st.session_state["data_df"]
+    _src_label = "SQL dump" if st.session_state.get("data_source") == "sql" else "CSV"
+    st.info(f"{_src_label} is loaded. Open **BATTERS**, **PACERS**, **SPINNERS**, or **LEADERBOARD** from the sidebar.")
+    st.write(f"Total deliveries: {len(df_loaded):,}")
+    if st.checkbox("Show first 5 rows"):
+        st.write(f"**File:** `{st.session_state.get('file_name', 'N/A')}`")
+        st.dataframe(df_loaded.head())
 
-# DATA PREVIEW
-if 'data_df' in st.session_state:
-    st.write(f"**Total Deliveries Loaded:** {len(st.session_state['data_df']):,}")
+import streamlit.components.v1 as components
+
+st.markdown("""
+    <script>
+        // We set up an observer to watch for title changes and force it back
+        const targetNode = document.querySelector('title');
+        const observer = new MutationObserver(function(mutations) {
+            if (document.title !== "VR DANshboard") {
+                document.title = "VR DANshboard";
+            }
+        });
+        observer.observe(targetNode, { childList: true, subtree: true, characterData: true });
+        // Set it initially
+        document.title = "VR DANshboard";
+    </script>
+""", unsafe_allow_html=True)
