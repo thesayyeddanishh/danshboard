@@ -97,11 +97,21 @@ class _Bad(Exception):
 
 
 def newline_stats(data: bytes):
-    """(CRLF pairs, standalone LF bytes). A binary dump normally has plenty of
-    standalone LF bytes; a file whose newlines were converted has none."""
-    crlf = data.count(b"\r\n")
-    lone_lf = len(re.findall(rb"(?<!\r)\n", data))
+    """Return (CRLF pairs, standalone LF bytes) without decoding the archive."""
+    crlf = data.count(b"\\r\\n")
+    lone_lf = len(re.findall(rb"(?<!\\r)\\n", data))
     return crlf, lone_lf
+
+
+def _normalise_text_mode_dump(data: bytes) -> Optional[bytes]:
+    """Return a candidate undoing likely LF-to-CRLF conversion; validate before use."""
+    if not data.startswith(b"PGDMP"):
+        return None
+    crlf, lone_lf = newline_stats(data)
+    if crlf < 50 or lone_lf != 0:
+        return None
+    candidate = data.replace(b"\\r\\n", b"\\n")
+    return candidate if candidate != data else None
 
 
 def _explain(data: bytes, err: "_Bad", version: str = "") -> str:
@@ -449,8 +459,8 @@ def build_dashboard_df(t: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
-def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
-    """Parse the dump and return the needed tables as DataFrames of strings."""
+def _read_tables_once(data: bytes) -> Dict[str, pd.DataFrame]:
+    """Parse one byte representation without attempting recovery."""
     version = ""
     try:
         buf = _Buf(data)
@@ -460,9 +470,7 @@ def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
     except _Bad as err:
         raise DumpReadError(_explain(data, err, version)) from err
     except (IndexError, ValueError, struct.error) as exc:
-        raise DumpReadError(
-            _explain(data, _Bad("archive structure", repr(exc)), version)
-        ) from exc
+        raise DumpReadError(_explain(data, _Bad("archive structure", repr(exc)), version)) from exc
 
     entries = {e["tag"]: e for e in toc.entries if e["desc"] == "TABLE DATA"}
     out: Dict[str, pd.DataFrame] = {}
@@ -471,12 +479,32 @@ def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
             out[name] = _copy_to_df(blocks[name], _copy_columns(entries[name]), cols)
         except DumpReadError:
             raise
-        except Exception as exc:  # pandas parsing problems etc.
+        except Exception as exc:
             raise DumpReadError(
                 f"Could not parse the data of table {name} (dump format {version}): "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
     return out
+
+
+def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
+    """Parse a dump and retry a normalised candidate only when conversion is likely."""
+    try:
+        return _read_tables_once(data)
+    except DumpReadError as original_error:
+        candidate = _normalise_text_mode_dump(data)
+        if candidate is None:
+            raise
+        try:
+            return _read_tables_once(candidate)
+        except DumpReadError as candidate_error:
+            raise DumpReadError(
+                "The uploaded custom-format dump appears to have had its line endings "
+                "converted, but reversing that conversion did not produce a readable "
+                "archive. The file may also be truncated or otherwise corrupted; "
+                "the parser cannot safely reconstruct missing binary data. "
+                f"Original read error: {original_error}. After normalisation: {candidate_error}"
+            ) from candidate_error
 
 
 def load_dashboard_df(data: bytes) -> pd.DataFrame:
