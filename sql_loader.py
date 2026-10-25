@@ -1,5 +1,5 @@
 """
-Load a PostgreSQL custom-format dump (``pg_dump -Fc``) of the Hawk-Eye
+Load a PostgreSQL dump (custom ``pg_dump -Fc`` or plain-text format) of the Hawk-Eye
 ``cricketdatabase`` and turn it into the same DataFrame the dashboard gets
 from a CSV export.
 
@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import csv
 import io
+import itertools
+import math
 import re
 import struct
 import zlib
@@ -106,6 +108,13 @@ def newline_stats(data: bytes):
 
 def _explain(data: bytes, err: "_Bad", version: str = "") -> str:
     crlf, lone_lf = newline_stats(data)
+    if crlf >= 50 and lone_lf == 0 and err.where.startswith("table "):
+        return (
+            "This dump was damaged before upload (every newline byte was converted to CRLF, "
+            f"{crlf:,} places). The dashboard repaired it automatically where it could, but "
+            f"{err.where} still has damage that could not be resolved: {err.detail}. "
+            "If you can, export it again with `pg_dump -Fc -f file.dump ...` (not with `>`)."
+        )
     if crlf >= 50 and lone_lf == 0:
         return (
             f"The file was damaged before it reached the dashboard: it contains "
@@ -289,6 +298,291 @@ def _table_blocks(buf: _Buf, toc: _Toc, wanted: List[str]) -> Dict[str, bytes]:
 
 
 # --------------------------------------------------------------------------
+# Automatic repair of newline-damaged dumps
+#
+# Some tools write the binary dump in text mode: every 0x0A byte that is not
+# already preceded by 0x0D becomes 0x0D 0x0A.  Reading it back, a "\r\n" pair
+# is therefore EITHER an inserted CR (the original byte was a lone LF - the
+# overwhelmingly common case) OR a genuine CR LF in the original (about 1 in
+# 65,000 byte pairs of compressed data).  The archive itself tells us which:
+#   * every data chunk has a known length, and the next chunk header must
+#     appear exactly where that many ORIGINAL bytes end  -> how many pairs in a
+#     chunk are genuine;
+#   * only the correct placement decompresses into COPY rows with the right
+#     number of tab-separated columns;
+#   * zlib's Adler-32 checksum confirms the whole stream at the end.
+# --------------------------------------------------------------------------
+_AMB = re.compile(rb"(?<!\r)\r\n")
+_CTRL = re.compile(rb"[\x00-\x08\x0b-\x1f]")
+_MAX_KEEPS = 6
+_MAX_COMBOS = 300_000
+_MAX_HYPOTHESES = 32
+
+
+def is_newline_damaged(data: bytes) -> bool:
+    if data[:5] != b"PGDMP":
+        return False
+    crlf, lone_lf = newline_stats(data)
+    return crlf >= 50 and lone_lf == 0
+
+
+class _Hyp:
+    __slots__ = ("pos", "d", "carry", "parts", "ended")
+
+    def __init__(self, pos, d, carry, parts, ended=False):
+        self.pos, self.d, self.carry, self.parts, self.ended = pos, d, carry, parts, ended
+
+
+class _Repairer:
+    def __init__(self, data: bytes):
+        self.C = data
+        self._progress = 0.0
+        self.amb = np.fromiter((m.start() for m in _AMB.finditer(data)), dtype=np.int64)
+
+    # -- locating a block --------------------------------------------------
+    def _locate(self, entry: dict) -> List[int]:
+        off = entry["off"]
+        c = off
+        for _ in range(100):
+            nc = off + int(np.searchsorted(self.amb, c, side="left"))
+            if nc == c:
+                break
+            c = nc
+        slack = 3 * (c // 65536) + 120
+        lo, hi = max(0, c - slack), c + 16
+        idb = (b"\x01" if entry["id"] < 0 else b"\x00") + abs(entry["id"]).to_bytes(4, "little")
+        variants = {idb}
+        for i, b in enumerate(idb):  # a 0x0A inside the id shows up as CR LF
+            if b == 0x0A:
+                variants.add(idb[:i] + b"\r\n" + idb[i + 1 :])
+        found = []
+        for v in variants:
+            pat = b"\x01" + v
+            i = self.C.find(pat, lo, hi + len(pat))
+            while i >= 0:
+                found.append((i, len(pat)))
+                i = self.C.find(pat, i + 1, hi + len(pat))
+        return sorted(found)
+
+    # -- helpers -------------------------------------------------------------
+    def _hdr(self, q: int):
+        """Chunk header (sign + 4-byte int), treating CR LF as an inserted CR."""
+        C = self.C
+        out = bytearray()
+        i = q
+        for _ in range(5):
+            if i >= len(C):
+                return None
+            if C[i : i + 2] == b"\r\n":
+                out.append(0x0A)
+                i += 2
+            else:
+                out.append(C[i])
+                i += 1
+        if out[0] != 0:
+            return None
+        return int.from_bytes(out[1:5], "little"), i
+
+    def _next_ok(self, q: int, n_cur: int) -> bool:
+        h = self._hdr(q)
+        return h is not None and 0 <= h[0] <= n_cur
+
+    def _candidates(self, p: int, n: int):
+        win = self.C[p : p + n + n // 8 + 64]
+        amb = [m.start() for m in _AMB.finditer(win)]
+        L = len(amb)
+        res = []
+        for m in range(L + 1):
+            for k in range(min(m, _MAX_KEEPS) + 1):
+                e = n + m - k
+                if e > len(win):
+                    continue
+                if m > 0 and amb[m - 1] + 2 > e:
+                    continue
+                if m < L and e > amb[m]:
+                    continue
+                if self._next_ok(p + e, n):
+                    res.append((k, e, m))
+        res.sort()
+        return win, amb, res
+
+    @staticmethod
+    def _placements(win, amb, e, m, k):
+        if k == 0:
+            yield _AMB.sub(b"\n", win[:e])
+            return
+        for keep in itertools.combinations(range(m), k):
+            ks = set(keep)
+            parts, cpos = [], 0
+            for i in range(m):
+                a = amb[i]
+                parts.append(win[cpos:a])
+                parts.append(b"\r\n" if i in ks else b"\n")
+                cpos = a + 2
+            parts.append(win[cpos:e])
+            yield b"".join(parts)
+
+    @staticmethod
+    def _advance(h: _Hyp, o: bytes, ntab: int, new_pos: int):
+        d = h.d.copy()
+        try:
+            out = d.decompress(o)
+        except zlib.error:
+            return None
+        if _CTRL.search(out):
+            return None
+        buf = h.carry + out
+        nl = buf.rfind(b"\n")
+        ended = h.ended
+        if nl >= 0:
+            if not ended:
+                for ln in buf[:nl].split(b"\n"):
+                    if ln == b"\\.":
+                        ended = True
+                        break
+                    if ln.count(b"\t") != ntab:
+                        return None
+            carry = buf[nl + 1 :]
+        else:
+            carry = buf
+        if not ended and carry.count(b"\t") > ntab:
+            return None
+        return _Hyp(new_pos, d, carry, (h.parts, out), ended)
+
+    # -- one block -----------------------------------------------------------
+    def read_block(self, entry: dict, ntab: int) -> bytes:
+        where = f"table {entry['tag']}"
+        starts = self._locate(entry)
+        if not starts:
+            raise _Bad(where, "could not locate its data block")
+        last_err = "no valid reconstruction"
+        for start, patlen in starts:
+            try:
+                return self._read_from(start + patlen, ntab, where)
+            except _Bad as exc:
+                last_err = exc.detail
+        raise _Bad(where, last_err)
+
+    def _read_from(self, q: int, ntab: int, where: str) -> bytes:
+        h0 = self._hdr(q)
+        if h0 is None:
+            raise _Bad(where, "bad chunk header")
+        hyps = [_Hyp(q, zlib.decompressobj(), b"", None)]
+        finished: List[_Hyp] = []
+        block_end = len(self.C)
+        self._progress = 0.0
+        while hyps:
+            self._progress = max(self._progress, (hyps[0].pos - q) / max(1, block_end - q))
+            nxt: List[_Hyp] = []
+            for h in hyps:
+                hd = self._hdr(h.pos)
+                if hd is None:
+                    continue
+                n, p = hd
+                if n == 0:
+                    finished.append(h)
+                    continue
+                win, amb, cands = self._candidates(p, n)
+                combos = 0
+                for k, e, m in cands:
+                    combos += math.comb(m, k)
+                    if combos > _MAX_COMBOS:
+                        break
+                    for o in self._placements(win, amb, e, m, k):
+                        nh = self._advance(h, o, ntab, p + e)
+                        if nh is not None:
+                            nxt.append(nh)
+                            if len(nxt) >= _MAX_HYPOTHESES:
+                                break
+                    if len(nxt) >= _MAX_HYPOTHESES:
+                        break
+            hyps = nxt
+            if len(hyps) > 1:  # drop duplicates that ended at the same place with the same text tail
+                seen, uniq = set(), []
+                for h in hyps:
+                    key = (h.pos, h.carry[-64:], id(h.parts))
+                    if key not in seen:
+                        seen.add(key)
+                        uniq.append(h)
+                hyps = uniq
+        for h in finished:
+            if h.d.eof:
+                chunks, node = [], h.parts
+                while node is not None:
+                    node, out = node
+                    chunks.append(out)
+                return b"".join(reversed(chunks))
+        raise _Bad(
+            where,
+            f"repair stopped after {self._progress:.0%} of this table's data "
+            "(unexplained byte-level damage)",
+        )
+
+    def blocks(self, toc: "_Toc", wanted: List[str]) -> Dict[str, bytes]:
+        entries = {e["tag"]: e for e in toc.entries if e["desc"] == "TABLE DATA"}
+        out = {}
+        for name in wanted:
+            e = entries.get(name)
+            if e is None:
+                raise DumpReadError("The dump is missing required table(s): " + name)
+            if e["flag"] != 2:
+                raise _Bad(f"table {name}", "dump has no block offsets (not seekable)")
+            ntab = len(_copy_columns(e)) - 1
+            out[name] = self.read_block(e, ntab)
+        return out
+
+
+# --------------------------------------------------------------------------
+# Plain-text dumps (pgAdmin "Plain" format / pg_dump -Fp)
+# Tables are stored as COPY ... FROM stdin; blocks of tab-separated rows.
+# Line endings may have been converted to CRLF - harmless here, because a real
+# CR inside a value is always written as the two characters \r in COPY text.
+# --------------------------------------------------------------------------
+_COPY_RE = re.compile(
+    rb'^COPY\s+((?:"?[\w$]+"?\.)?"?[\w$]+"?)\s*\(([^)]*)\)\s+FROM\s+stdin;[ \t]*\r?\n',
+    re.M | re.I,
+)
+
+
+def _read_plain(data: bytes) -> Dict[str, pd.DataFrame]:
+    text = data.replace(b"\r\n", b"\n")
+    found: Dict[str, tuple] = {}
+    for m in _COPY_RE.finditer(text):
+        name = m.group(1).split(b".")[-1].strip(b'"').decode("utf-8", "replace")
+        cols = [c.strip().strip(b'"').decode("utf-8", "replace") for c in m.group(2).split(b",")]
+        end = text.find(b"\n\\.\n", m.end() - 1)
+        if end < 0:
+            end = len(text)
+        body = text[m.end() : end + 1] if end >= m.end() else b""
+        found[name] = (cols, body)
+    if not found:
+        if re.search(rb"^INSERT\s+INTO", text, re.M | re.I):
+            raise DumpReadError(
+                "This SQL file stores its data as INSERT statements, which are not supported. "
+                "In pgAdmin's Backup dialog leave 'Use INSERT commands' switched off."
+            )
+        raise DumpReadError(
+            "No table data found. Upload a pgAdmin backup in 'Custom' or 'Plain' format "
+            "(plain files must contain COPY ... FROM stdin; sections)."
+        )
+    missing = [t for t in TABLE_COLUMNS if t not in found]
+    if missing:
+        raise DumpReadError("The dump is missing required table(s): " + ", ".join(missing))
+    out: Dict[str, pd.DataFrame] = {}
+    for name, wanted in TABLE_COLUMNS.items():
+        cols, body = found[name]
+        try:
+            out[name] = _copy_to_df(body, cols, wanted)
+        except DumpReadError:
+            raise
+        except Exception as exc:
+            raise DumpReadError(
+                f"Could not parse the data of table {name}: {type(exc).__name__}: {exc}"
+            ) from exc
+    return out
+
+
+# --------------------------------------------------------------------------
 # COPY text -> DataFrame
 # --------------------------------------------------------------------------
 _ESC = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "\\": "\\"}
@@ -452,11 +746,21 @@ def build_dashboard_df(t: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
     """Parse the dump and return the needed tables as DataFrames of strings."""
     version = ""
+    if data[:5] != b"PGDMP":
+        return _read_plain(data)
     try:
-        buf = _Buf(data)
-        toc = _parse_toc(buf)
-        version = ".".join(str(v) for v in toc.version)
-        blocks = _table_blocks(buf, toc, list(TABLE_COLUMNS))
+        if is_newline_damaged(data):
+            # parse the table of contents from a simple CR LF -> LF copy, then
+            # rebuild each needed data block exactly (see _Repairer)
+            buf = _Buf(_AMB.sub(b"\n", data))
+            toc = _parse_toc(buf)
+            version = ".".join(str(v) for v in toc.version)
+            blocks = _Repairer(data).blocks(toc, list(TABLE_COLUMNS))
+        else:
+            buf = _Buf(data)
+            toc = _parse_toc(buf)
+            version = ".".join(str(v) for v in toc.version)
+            blocks = _table_blocks(buf, toc, list(TABLE_COLUMNS))
     except _Bad as err:
         raise DumpReadError(_explain(data, err, version)) from err
     except (IndexError, ValueError, struct.error) as exc:
@@ -481,4 +785,6 @@ def read_tables(data: bytes) -> Dict[str, pd.DataFrame]:
 
 def load_dashboard_df(data: bytes) -> pd.DataFrame:
     """Dump bytes -> DataFrame with the same columns as the CSV export."""
-    return build_dashboard_df(read_tables(data))
+    df = build_dashboard_df(read_tables(data))
+    df.attrs["sql_repaired"] = is_newline_damaged(data)
+    return df

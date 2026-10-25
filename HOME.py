@@ -71,6 +71,8 @@ def process_upload(uploaded_file, source: str = "csv") -> bool:
         if source == "sql":
             with st.spinner("Reading SQL dump..."):
                 df_raw = load_dashboard_df(uploaded_file.getvalue())
+            if df_raw.attrs.get("sql_repaired"):
+                st.info("This dump had its newlines converted to CRLF during export. It was repaired automatically.")
         else:
             data = uploaded_file.getvalue().decode("utf-8")
             df_raw = pd.read_csv(StringIO(data))
@@ -142,9 +144,9 @@ else:
     with st.expander("SQL dump requirements"):
         st.markdown(
             """
-Upload a PostgreSQL dump of the Hawk-Eye `cricketdatabase` made with `pg_dump -Fc`
-(custom format). All the required dashboard columns are built automatically from the
-database tables, so the result is identical to a CSV export. Plain-text `.sql` files are not supported.
+Upload a backup of the Hawk-Eye `cricketdatabase` made with pgAdmin (Backup, Format:
+**Plain** or **Custom**). All the required dashboard columns are built automatically from
+the database tables, so the result is identical to a CSV export.
             """
         )
     uploaded_file = st.file_uploader(

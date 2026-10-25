@@ -17,12 +17,17 @@ def check(path: str) -> None:
     crlf, lone_lf = L.newline_stats(data)
     print(f"CRLF pairs: {crlf:,}   standalone LF bytes: {lone_lf:,}")
     if crlf >= 50 and lone_lf == 0:
-        print("=> newline-converted (damaged) binary file; re-export it with pg_dump -Fc -f")
+        print("=> newline-converted (damaged) binary file")
     if not data.startswith(b"PGDMP"):
-        print("=> not a pg_dump custom-format file (does not start with PGDMP)")
+        print("=> not a custom-format dump; trying it as a plain-text (COPY) dump")
+        try:
+            df = L.load_dashboard_df(data)
+            print(f"full load: OK  {df.shape[0]:,} deliveries x {df.shape[1]} columns")
+        except L.DumpReadError as exc:
+            print("full load: FAILED -", exc)
         return
     try:
-        buf = L._Buf(data)
+        buf = L._Buf(L._AMB.sub(b"\n", data) if L.is_newline_damaged(data) else data)
         toc = L._parse_toc(buf)
     except (L._Bad, L.DumpReadError) as exc:
         print("table of contents: FAILED -", exc)
@@ -32,12 +37,19 @@ def check(path: str) -> None:
     tables = {e["tag"]: e for e in toc.entries if e["desc"] == "TABLE DATA"}
     needed = list(L.TABLE_COLUMNS)
     print(f"{len(tables)} tables with data; missing needed: {[t for t in needed if t not in tables] or 'none'}")
+    damaged = L.is_newline_damaged(data)
+    if damaged:
+        print("=> newline-damaged file: trying the automatic repair table by table")
+        rep = L._Repairer(data)
     for name in needed:
         e = tables.get(name)
         if e is None:
             continue
         try:
-            text = L._read_block(buf, toc, e, e["off"] if e["flag"] == 2 else buf.pos)
+            if damaged:
+                text = rep.read_block(e, len(L._copy_columns(e)) - 1)
+            else:
+                text = L._read_block(buf, toc, e, e["off"] if e["flag"] == 2 else buf.pos)
             rows = text.count(b"\n") - 1 if text.strip() != b"\\." else 0
             print(f"  {name:22s} OK   ~{max(rows, 0):,} rows")
         except (L._Bad, zlib.error) as exc:
