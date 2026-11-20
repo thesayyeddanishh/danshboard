@@ -10,7 +10,6 @@ import pandas as pd
 from io import StringIO
 
 from cricket_config import FORMAT_KEYS, FORMAT_LABELS, resolve_format
-from sql_loader import DumpReadError, load_dashboard_df
 
 REQUIRED_COLS = [
     "Innings",
@@ -64,42 +63,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-def process_upload(uploaded_file, source: str = "csv") -> bool:
+def process_upload(uploaded_file) -> bool:
     if uploaded_file is None:
         return False
     try:
-        if source == "sql":
-            with st.spinner("Reading SQL dump..."):
-                df_raw = load_dashboard_df(uploaded_file.getvalue())
-            if df_raw.attrs.get("sql_repaired"):
-                st.info("This dump had its newlines converted to CRLF during export. It was repaired automatically.")
-        else:
-            data = uploaded_file.getvalue().decode("utf-8")
-            df_raw = pd.read_csv(StringIO(data))
+        data = uploaded_file.getvalue().decode("utf-8")
+        df_raw = pd.read_csv(StringIO(data))
         if not all(col in df_raw.columns for col in REQUIRED_COLS):
             missing = [c for c in REQUIRED_COLS if c not in df_raw.columns]
-            label = "SQL dump" if source == "sql" else "CSV file"
-            st.error(f"The {label} is missing required columns: {', '.join(missing)}")
+            st.error(f"The CSV file is missing required columns: {', '.join(missing)}")
             st.session_state.pop("data_df", None)
             st.session_state.pop("file_name", None)
             return False
         st.session_state["data_df"] = df_raw
         st.session_state["file_name"] = uploaded_file.name
-        st.session_state["data_source"] = source
         if "initial_load_complete" in st.session_state:
             st.success(f"Data successfully replaced!\n Total deliveries loaded: {len(df_raw):,}.")
         else:
             st.session_state["initial_load_complete"] = True
             st.success(
                 f"Data uploaded successfully! File: {uploaded_file.name}. "
-                "Use the sidebar pages: Batters, Pacers, Spinners, Leaderboard."
+                "Use the sidebar pages: Batters, Pacers, Spinners, Leaderboard, or DANsh AI."
             )
         return True
-    except DumpReadError as e:
-        st.error(str(e))
-        st.session_state.pop("data_df", None)
-        st.session_state.pop("file_name", None)
-        return False
     except Exception as e:
         st.error(f"Error reading file: {e}")
         st.session_state.pop("data_df", None)
@@ -123,46 +109,29 @@ st.session_state["cricket_format"] = FORMAT_KEYS[fmt_labels.index(choice)]
 st.session_state["speed_unit"] = (unit_choice or _unit_default).lower()
 _cfg = resolve_format(st.session_state["cricket_format"])
 
-st.subheader("2. Upload CSV or SQL dump")
-source_choice = st.radio("Data source", ["CSV", "SQL dump"], horizontal=True, key="source_select")
-source_key = "sql" if source_choice == "SQL dump" else "csv"
-
-if source_key == "csv":
-    with st.expander("Required CSV columns when exporting from CDS"):
-        st.markdown(
-            """
+st.subheader("2. Upload CSV")
+with st.expander("Required CSV columns when exporting from CDS"):
+    st.markdown(
+        """
 * **General:** `Innings`, `Over`, `Ball`, `BowlerName`, `BatsmanName`, `BowlingTeam`, `BattingTeam`
 * **Handedness:** `IsBowlerRightHanded`, `IsBatsmanRightHanded`
 * **Results:** `Wicket`, `Runs`
 * **Coordinates:** `Bounce X Y`, `Interception X Y Z`, `Crease Y Z`, `Stumps Y Z`, `Release Y Z`, `Landing X Y`
 * **Delivery:** `DeliveryType`, `ReleaseSpeed`, `Deviation`, `Swing`
 * **Match:** `Ground`, `Tour`, `Year`, `Match`
-            """
-        )
-    uploaded_file = st.file_uploader("Upload your CSV file here", type=["csv"], key="main_uploader")
-else:
-    with st.expander("SQL dump requirements"):
-        st.markdown(
-            """
-Upload a backup of the Hawk-Eye `cricketdatabase` made with pgAdmin (Backup, Format:
-**Plain** or **Custom**). All the required dashboard columns are built automatically from
-the database tables, so the result is identical to a CSV export.
-            """
-        )
-    uploaded_file = st.file_uploader(
-        "Upload your SQL dump here", type=["sql", "dump", "backup"], key="sql_uploader"
+        """
     )
+uploaded_file = st.file_uploader("Upload your CSV file here", type=["csv"], key="main_uploader")
 
 if uploaded_file is not None:
     if "data_df" not in st.session_state or uploaded_file.name != st.session_state.get("file_name"):
-        process_upload(uploaded_file, source_key)
+        process_upload(uploaded_file)
       
 st.write("Wait for the next line to turn blue after uploading")
 
 if "data_df" in st.session_state:
     df_loaded = st.session_state["data_df"]
-    _src_label = "SQL dump" if st.session_state.get("data_source") == "sql" else "CSV"
-    st.info(f"{_src_label} is loaded. Open **BATTERS**, **PACERS**, **SPINNERS**, or **LEADERBOARD** from the sidebar.")
+    st.info("CSV is loaded. Open **BATTERS**, **PACERS**, **SPINNERS**, **LEADERBOARD**, or **DANsh AI** from the sidebar.")
     st.write(f"Total deliveries: {len(df_loaded):,}")
     if st.checkbox("Show first 5 rows"):
         st.write(f"**File:** `{st.session_state.get('file_name', 'N/A')}`")
