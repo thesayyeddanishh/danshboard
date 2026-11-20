@@ -55,21 +55,53 @@ def extract_response_text(payload: Dict[str, Any]) -> str:
 
 
 def call_grok(prompt: str, api_key: str, *, model: str = "grok-4.7") -> str:
-    r = requests.post(
-        "https://api.x.ai/v1/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "input": prompt,
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "max_output_tokens": 5000,
-            "store": False,
-        },
-        timeout=180,
-    )
-    r.raise_for_status()
-    return extract_response_text(r.json())
+    """Call xAI Responses API with a canonical OpenResponses payload.
+
+    The API currently accepts both string and array input, but the role/content
+    form is the most explicit and gives much better diagnostics when a request
+    is rejected. We also surface xAI's actual error body instead of only the
+    generic HTTP status.
+    """
+    url = "https://api.x.ai/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "max_output_tokens": 5000,
+        "store": False,
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=180)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Could not reach xAI Responses API: {e}") from e
+
+    if not r.ok:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:2000]
+        raise RuntimeError(f"xAI Responses API returned HTTP {r.status_code}: {detail}")
+
+    try:
+        body = r.json()
+    except Exception as e:
+        raise RuntimeError(f"xAI returned a non-JSON response: {r.text[:1000]}") from e
+
+    text = extract_response_text(body)
+    if not text:
+        raise RuntimeError(f"xAI returned no text output. Response: {body}")
+    return text
 
 
 def parse_json(text: str) -> Dict[str, Any]:
