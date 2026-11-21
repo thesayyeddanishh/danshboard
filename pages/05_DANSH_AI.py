@@ -39,8 +39,13 @@ st.markdown(
 )
 
 
-def xai_key() -> str:
-    return os.getenv("XAI_API_KEY", st.secrets.get("XAI_API_KEY", "") if hasattr(st, "secrets") else "")
+def provider_key(provider: str) -> str:
+    env_name = "XAI_API_KEY" if provider == "Grok / xAI" else "GROQ_API_KEY"
+    try:
+        secret_value = st.secrets.get(env_name, "") if hasattr(st, "secrets") else ""
+    except Exception:
+        secret_value = ""
+    return os.getenv(env_name, secret_value)
 
 
 def extract_response_text(payload: Dict[str, Any]) -> str:
@@ -49,20 +54,20 @@ def extract_response_text(payload: Dict[str, Any]) -> str:
     chunks = []
     for item in payload.get("output", []) or []:
         for c in item.get("content", []) or []:
-            if c.get("type") == "output_text" and c.get("text"):
+            if c.get("type") in {"output_text", "text"} and c.get("text"):
                 chunks.append(c["text"])
     return "\n".join(chunks).strip()
 
 
-def call_grok(prompt: str, api_key: str, *, model: str = "grok-4.7") -> str:
-    """Call xAI Responses API with a canonical OpenResponses payload.
+def call_ai(prompt: str, api_key: str, *, provider: str, model: str) -> str:
+    """Call either xAI/Grok or Groq through their OpenAI-compatible Responses APIs."""
+    if provider == "Grok / xAI":
+        url = "https://api.x.ai/v1/responses"
+        provider_label = "xAI/Grok"
+    else:
+        url = "https://api.groq.com/openai/v1/responses"
+        provider_label = "Groq"
 
-    The API currently accepts both string and array input, but the role/content
-    form is the most explicit and gives much better diagnostics when a request
-    is rejected. We also surface xAI's actual error body instead of only the
-    generic HTTP status.
-    """
-    url = "https://api.x.ai/v1/responses"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -78,31 +83,29 @@ def call_grok(prompt: str, api_key: str, *, model: str = "grok-4.7") -> str:
         "temperature": 0.7,
         "top_p": 0.95,
         "max_output_tokens": 5000,
-        "store": False,
     }
 
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=180)
     except requests.RequestException as e:
-        raise RuntimeError(f"Could not reach xAI Responses API: {e}") from e
+        raise RuntimeError(f"Could not reach {provider_label} Responses API: {e}") from e
 
     if not r.ok:
         try:
             detail = r.json()
         except Exception:
             detail = r.text[:2000]
-        raise RuntimeError(f"xAI Responses API returned HTTP {r.status_code}: {detail}")
+        raise RuntimeError(f"{provider_label} Responses API returned HTTP {r.status_code}: {detail}")
 
     try:
         body = r.json()
     except Exception as e:
-        raise RuntimeError(f"xAI returned a non-JSON response: {r.text[:1000]}") from e
+        raise RuntimeError(f"{provider_label} returned a non-JSON response: {r.text[:1000]}") from e
 
     text = extract_response_text(body)
     if not text:
-        raise RuntimeError(f"xAI returned no text output. Response: {body}")
+        raise RuntimeError(f"{provider_label} returned no text output. Response: {body}")
     return text
-
 
 def parse_json(text: str) -> Dict[str, Any]:
     text = text.strip()
@@ -284,15 +287,38 @@ with c1:
 with c2:
     st.markdown(f'<div style="text-align:right;margin-top:15px"><span class="orange">{format_banner_caps(cfg)}</span><br>{len(df):,} deliveries</div>', unsafe_allow_html=True)
 
-api_key = xai_key()
 with st.sidebar:
     st.header("DANsh Controls")
-    api_override = st.text_input("xAI API key", value="", type="password", help="Optional. Prefer XAI_API_KEY in Streamlit secrets/environment.")
+    provider = st.selectbox(
+        "AI provider",
+        ["Grok / xAI", "Groq"],
+        index=0,
+        help="Choose which provider DANsh uses for planning and interpretation. Python still performs all numerical calculations locally.",
+    )
+
+    if provider == "Grok / xAI":
+        key_env = "XAI_API_KEY"
+        model_options = ["grok-4.7"]
+        key_label = "xAI API key"
+        key_help = "Optional. Prefer XAI_API_KEY in Streamlit secrets/environment."
+    else:
+        key_env = "GROQ_API_KEY"
+        model_options = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+        key_label = "Groq API key"
+        key_help = "Optional. Prefer GROQ_API_KEY in Streamlit secrets/environment."
+
+    api_key = provider_key(provider)
+    api_override = st.text_input(key_label, value="", type="password", help=key_help)
     if api_override.strip():
         api_key = api_override.strip()
-    model = st.selectbox("Grok model", ["grok-4.7"], index=0)
+
+    model = st.selectbox("Model", model_options, index=0)
     min_sample = st.number_input("Low-sample warning threshold", 1, 500, 10)
-    st.caption("Numerical calculations are performed locally from the uploaded dataset. Grok is used for planning and interpretation.")
+    if api_key:
+        st.success(f"{provider} connected")
+    else:
+        st.info(f"Add {key_env} to enable {provider}.")
+    st.caption("Grok/Groq plans and interprets. Python performs the deterministic cricket calculations locally.")
 
 examples = [
     "What are this bowler's strengths?",
@@ -319,12 +345,12 @@ if ask and question.strip():
     with st.spinner("DANsh is planning the analysis…"):
         try:
             if api_key:
-                planner_text = call_grok(build_planner_prompt(question, dataset_catalog(df), cfg, speed_unit), api_key, model=model)
+                planner_text = call_ai(build_planner_prompt(question, dataset_catalog(df), cfg, speed_unit), api_key, provider=provider, model=model)
                 plan = parse_json(planner_text)
             else:
                 plan = fallback_plan(question, df)
         except Exception as e:
-            st.warning(f"Grok planning failed, so DANsh used the local fallback planner: {e}")
+            st.warning(f"AI planning failed, so DANsh used the local fallback planner: {e}")
             plan = fallback_plan(question, df)
 
         # Resolve explicit names deterministically against the actual dataset.
@@ -356,13 +382,13 @@ Use concise professional cricket-analyst language. The user asked:
 CALCULATED EVIDENCE:
 {result_for_grok(question, plan, result)}
 """
-                answer = call_grok(interpretation_prompt, api_key, model=model)
+                answer = call_ai(interpretation_prompt, api_key, provider=provider, model=model)
                 st.markdown('<div class="ai-card">' + answer.replace("\n", "<br>") + '</div>', unsafe_allow_html=True)
             except Exception as e:
-                st.warning(f"Grok interpretation failed: {e}")
+                st.warning(f"AI interpretation failed: {e}")
                 st.info("The deterministic calculation is still shown below.")
     else:
-        st.info("No xAI API key configured. Showing deterministic analysis; add XAI_API_KEY to enable Grok planning and interpretation.")
+        st.info("No AI API key configured. Showing deterministic analysis; add the selected provider key to enable AI planning and interpretation.")
 
     m = result["metrics"]
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -397,4 +423,4 @@ CALCULATED EVIDENCE:
         })
 else:
     st.markdown("### Start with a question")
-    st.info("DANsh will turn the question into a structured plan, calculate the answer deterministically from Hawk-Eye data, then ask Grok to interpret the evidence.")
+    st.info("DANsh will turn the question into a structured plan, calculate the answer deterministically from Hawk-Eye data, then ask the selected AI provider to interpret the evidence.")
