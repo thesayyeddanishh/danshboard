@@ -53,3 +53,12 @@ Planner and interpretation output budgets are kept separate to reduce provider T
 - If AI planning fails, the local fallback still applies the detected filters instead of analysing the full dataset.
 - This prevents queries such as `Abhishek Sharma v Seam in 2025` from silently reverting to all deliveries.
 - The planner response budget is capped separately from the evidence interpretation call.
+
+
+## DANsh v6 UI / ranking improvements
+- Ranking questions such as Top-N batting/bowling metrics are compiled deterministically before any AI call.
+- Explicit RHB/LHB and pitch-length terms are enforced locally.
+- Rankings are sorted by the requested metric, not by delivery count.
+- Ranking results use a horizontal bar chart plus a readable evidence table.
+- Raw delivery rows are never sent to the AI interpretation step; only compact calculated evidence is sent.
+- The result page shows applied filters, ranking direction, sample size, visualisation, evidence, then AI interpretation.
