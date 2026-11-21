@@ -43,3 +43,13 @@ All critical cricket calculations are performed locally from the uploaded Hawk-E
 The planner no longer sends the full player/match catalog to the AI provider. It sends only compact metadata plus question-matched entity candidates. Explicit player, year, team, ground and Seam/Spin filters are also extracted deterministically before analysis. This prevents a failed AI planning request from silently analysing the entire dataset.
 
 Planner and interpretation output budgets are kept separate to reduce provider TPM pressure.
+
+
+## DANsh v5 planner safeguards
+
+- The planner no longer sends the complete player/match catalog to Grok or Groq.
+- Explicit player, year, and Seam/Spin constraints are extracted deterministically from the user question.
+- Those explicit constraints override an incomplete AI plan.
+- If AI planning fails, the local fallback still applies the detected filters instead of analysing the full dataset.
+- This prevents queries such as `Abhishek Sharma v Seam in 2025` from silently reverting to all deliveries.
+- The planner response budget is capped separately from the evidence interpretation call.
