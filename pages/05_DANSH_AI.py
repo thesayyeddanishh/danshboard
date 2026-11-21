@@ -31,7 +31,9 @@ st.markdown(
     section[data-testid="stSidebar"] { width: 200px !important; }
     .dansh-title { font-size: 2.25rem; font-weight: 850; letter-spacing: -1px; margin-bottom: 0; }
     .dansh-sub { color:#64748B; margin-top:-5px; margin-bottom:20px; }
-    .ai-card { background:#0f172a; color:#f8fafc; padding:18px 20px; border-radius:14px; }
+    .ai-card { border:1px solid #E2E8F0; padding:18px 20px; border-radius:14px; background:#F8FAFC; color:#1E293B; line-height:1.65; }
+    .result-kicker { color:#64748B; font-size:.82rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    .insight-card { border-left:4px solid #ff6600; background:#FFF7ED; padding:14px 16px; border-radius:10px; }
     .metric-card { border:1px solid #E2E8F0; border-radius:12px; padding:12px; background:#fff; }
     .orange { color:#ff6600; font-weight:800; }
     </style>
@@ -161,43 +163,50 @@ def infer_explicit_filters(question: str, df: pd.DataFrame) -> Dict[str, Any]:
     q = _norm_text(question)
     filters: Dict[str, Any] = {}
 
-    # Year: only accept years that actually exist in the loaded dataset.
     available_years = set(pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int).tolist()) if "Year" in df.columns else set()
     year_hits = [int(y) for y in re.findall(r"\b(20\d{2})\b", q) if int(y) in available_years]
     if year_hits:
         filters["year"] = year_hits[-1]
 
-    # Delivery type: Medium is analytically Seam by the user's established rule.
     if re.search(r"\b(SEAM|SEAMER|PACE|PACERS|FAST BOWLING)\b", q):
         filters["delivery_type"] = "Seam"
     elif re.search(r"\b(SPIN|SPINNER|SPINNERS)\b", q):
         filters["delivery_type"] = "Spin"
+
+    # Handedness: explicit RHB/LHB wording is a hard constraint.
+    if re.search(r"\b(RHB|RIGHT HAND|RIGHT HANDED|RIGHT-HANDED)\b", q):
+        filters["batter_hand"] = "Right"
+    elif re.search(r"\b(LHB|LEFT HAND|LEFT HANDED|LEFT-HANDED)\b", q):
+        filters["batter_hand"] = "Left"
+
+    # Existing format-specific pitch labels are used directly by cricket_config.py.
+    pitch_terms = [
+        "FULL TOSS", "YORKER", "THE SLOT", "SLOT", "LENGTH", "SHORT", "BOUNCER",
+        "OP", "GOOD", "FULL"
+    ]
+    for term in pitch_terms:
+        if re.search(rf"\b{re.escape(term)}\b", q):
+            filters["pitch_length"] = "The Slot" if term == "SLOT" else term.title()
+            if term == "OP": filters["pitch_length"] = "OP"
+            break
 
     batters = df["BatsmanName"].dropna().astype(str).unique().tolist() if "BatsmanName" in df.columns else []
     bowlers = df["BowlerName"].dropna().astype(str).unique().tolist() if "BowlerName" in df.columns else []
     batter_hits = _matching_names(question, batters, limit=5)
     bowler_hits = _matching_names(question, bowlers, limit=5)
 
-    # If the same name is present in both lists, keep the explicit role wording if available.
-    batter_set = set(batter_hits)
-    bowler_set = set(bowler_hits)
     role_words_bowler = bool(re.search(r"\b(BOWLER|BOWLING|BOWLED|SEAM BOWLER|SPINNER)\b", q))
-    role_words_batter = bool(re.search(r"\b(BATTER|BATSMAN|BATTING|BAT)\b", q))
+    role_words_batter = bool(re.search(r"\b(BATTER|BATSMAN|BATTING|BAT|RHB|LHB)\b", q))
 
-    if batter_hits and bowler_hits:
-        # Prefer distinct names where the query contains a matchup connector.
-        if re.search(r"\b(VS|VERSUS|AGAINST|MATCHUP|V)\b", q):
-            if len(batter_hits) == 1 and len(bowler_hits) >= 1:
-                filters["batter"] = batter_hits[0]
-                # Avoid assigning the same player as both unless there is no alternative.
-                other = next((n for n in bowler_hits if n != batter_hits[0]), None)
-                if other:
-                    filters["bowler"] = other
-            elif len(bowler_hits) == 1 and len(batter_hits) >= 1:
-                filters["bowler"] = bowler_hits[0]
-                other = next((n for n in batter_hits if n != bowler_hits[0]), None)
-                if other:
-                    filters["batter"] = other
+    if batter_hits and bowler_hits and re.search(r"\b(VS|VERSUS|AGAINST|MATCHUP|V)\b", q):
+        if len(batter_hits) == 1:
+            filters["batter"] = batter_hits[0]
+            other = next((n for n in bowler_hits if n != batter_hits[0]), None)
+            if other: filters["bowler"] = other
+        elif len(bowler_hits) == 1:
+            filters["bowler"] = bowler_hits[0]
+            other = next((n for n in batter_hits if n != bowler_hits[0]), None)
+            if other: filters["batter"] = other
     elif batter_hits and not role_words_bowler:
         filters["batter"] = batter_hits[0]
     elif bowler_hits and role_words_bowler and not role_words_batter:
@@ -207,6 +216,46 @@ def infer_explicit_filters(question: str, df: pd.DataFrame) -> Dict[str, Any]:
 
     return filters
 
+
+def infer_ranking_intent(question: str, role: str = "auto") -> Dict[str, Any]:
+    """Turn common ranking language into deterministic sort/group instructions."""
+    q = _norm_text(question)
+    top = re.search(r"\bTOP\s+(\d+)\b", q)
+    top_n = int(top.group(1)) if top else 10
+
+    if "BATTING STRIKE RATE" in q or "BATTING SR" in q or "STRIKE RATE" in q and role != "bowler":
+        metric = "batting_strike_rate"
+        group_by = "batter"
+    elif "BOWLING STRIKE RATE" in q or "BOWLING SR" in q:
+        metric = "bowling_strike_rate"
+        group_by = "bowler"
+    elif "BATTING AVERAGE" in q:
+        metric = "batting_average"; group_by = "batter"
+    elif "BOWLING AVERAGE" in q:
+        metric = "bowling_average"; group_by = "bowler"
+    elif "ECONOMY" in q:
+        metric = "economy"; group_by = "bowler"
+    elif "DOT" in q:
+        metric = "dot_pct"; group_by = "batter" if role != "bowler" else "bowler"
+    elif "WICKET" in q:
+        metric = "wickets"; group_by = "bowler"
+    elif "RUN" in q:
+        metric = "runs"; group_by = "batter" if role != "bowler" else "bowler"
+    else:
+        metric = "batting_strike_rate" if role == "batter" else "runs"
+        group_by = "batter" if role != "bowler" else "bowler"
+
+    descending = True
+    if any(x in q for x in ["LOWEST", "WORST", "LEAST"]):
+        descending = False
+    elif "BEST" in q or "HIGHEST" in q or "TOP" in q:
+        descending = True
+
+    # For efficiency metrics, lower is better when the user says "best".
+    if "BEST" in q and metric in {"economy", "bowling_average", "bowling_strike_rate"} and "HIGHEST" not in q:
+        descending = False
+
+    return {"metric": metric, "group_by": group_by, "top_n": top_n, "sort_desc": descending}
 
 def build_planner_prompt(question: str, catalog: Dict[str, Any], cfg, speed_unit: str) -> str:
     # Keep this prompt deliberately small: Groq's current on-demand TPM limit can be 8k.
@@ -233,23 +282,33 @@ QUESTION:
 """
 
 
+def is_simple_ranking_query(question: str) -> bool:
+    q = _norm_text(question)
+    ranking_words = any(x in q for x in ["TOP ", "BEST ", "HIGHEST ", "LOWEST ", "WORST ", "RANK", "LEADERBOARD"])
+    metric_words = any(x in q for x in ["STRIKE RATE", "BATTING SR", "BOWLING SR", "AVERAGE", "ECONOMY", "DOT", "WICKET", "RUN"])
+    return ranking_words and metric_words
+
+
 def fallback_plan(question: str, df: pd.DataFrame) -> Dict[str, Any]:
     q = question.lower()
     filters = infer_explicit_filters(question, df)
     has_batter = bool(filters.get("batter"))
     has_bowler = bool(filters.get("bowler"))
-    role = "both" if has_batter and has_bowler else "batter" if has_batter else "bowler" if has_bowler else ("bowler" if any(x in q for x in ["bowler", "bowling", "bowled", "seam bowler", "spinner"]) else "batter" if any(x in q for x in ["batter", "batting", "batsman"]) else "auto")
-    analysis_type = "matchup" if has_batter and has_bowler or " vs " in q or "versus" in q or "matchup" in q else "ground" if "ground" in q or "venue" in q else "strengths" if "strength" in q else "swot" if "swot" in q else "metric"
-    metric = "wickets" if "wicket" in q else "economy" if "economy" in q else "batting_strike_rate" if "strike rate" in q and role == "batter" else "bowling_strike_rate" if "strike rate" in q else "runs"
+    role = "both" if has_batter and has_bowler else "batter" if has_batter else "bowler" if has_bowler else ("bowler" if any(x in q for x in ["bowler", "bowling", "bowled", "seam bowler", "spinner"]) else "batter" if any(x in q for x in ["batter", "batting", "batsman", "rhb", "lhb"]) else "auto")
+    ranking = infer_ranking_intent(question, role)
+    analysis_type = "comparison" if "COMPARE" in q or "VERSUS" in q else "matchup" if has_batter and has_bowler or " vs " in q or "versus" in q or "matchup" in q else "ground" if "ground" in q or "venue" in q else "strengths" if "strength" in q else "swot" if "swot" in q else "metric"
+    # Ranking questions should always be visualised as a sorted bar chart.
+    visualization = "bar" if ranking["group_by"] else "table"
     return {
         "analysis_type": analysis_type,
         "role": role,
         "filters": filters,
-        "metric": metric,
-        "group_by": "pitch_length" if "length" in q else "phase" if "phase" in q or "overs" in q else None,
-        "compare_to_baseline": "better" in q or "worse" in q or "strength" in q,
-        "visualization": "bar" if "length" in q or "phase" in q else "table",
-        "top_n": 10,
+        "metric": ranking["metric"],
+        "group_by": ranking["group_by"] if any(x in q for x in ["top ", "best", "highest", "lowest", "worst", "rank", "leaderboard"]) else ("pitch_length" if "length" in q else "phase" if "phase" in q or "overs" in q else None),
+        "compare_to_baseline": False,
+        "visualization": visualization,
+        "top_n": ranking["top_n"],
+        "sort_desc": ranking["sort_desc"],
         "min_sample": 10,
         "user_needs_clarification": False,
     }
@@ -269,7 +328,7 @@ def run_analysis(df: pd.DataFrame, plan: Dict[str, Any], cfg, speed_unit: str) -
     if plan.get("analysis_type") in {"matchup", "key_matchups"} and not group_by:
         result["data"] = matchup_analysis(d, int(plan.get("top_n") or 15))
     elif group_by:
-        g = group_analysis(d, group_by, role, int(plan.get("top_n") or 10))
+        g = group_analysis(d, group_by, role, int(plan.get("top_n") or 10), metric=str(plan.get("metric") or "runs"), sort_desc=bool(plan.get("sort_desc", True)))
         result["data"] = g
     else:
         result["data"] = pd.DataFrame([result["metrics"]])
@@ -290,51 +349,67 @@ def run_analysis(df: pd.DataFrame, plan: Dict[str, Any], cfg, speed_unit: str) -
 
 
 def result_for_grok(question: str, plan: Dict[str, Any], result: Dict[str, Any]) -> str:
-    clean = dict(result)
-    if isinstance(clean.get("data"), pd.DataFrame):
-        clean["data"] = clean["data"].head(20).to_dict(orient="records")
-    return json.dumps({"question": question, "plan": plan, "result": clean}, default=str)
+    # Never send raw delivery rows back to the LLM. Only send the compact calculated evidence.
+    clean = {
+        "rows": result.get("rows"),
+        "role": result.get("role"),
+        "metrics": result.get("metrics"),
+        "baseline": result.get("baseline"),
+        "confidence": result.get("confidence"),
+    }
+    if isinstance(result.get("data"), pd.DataFrame):
+        clean["data"] = result["data"].head(20).to_dict(orient="records")
+    return json.dumps({"question": question, "plan": plan, "result": clean}, default=str, separators=(",", ":"))
+
+
+def _metric_column(metric: str) -> str:
+    return {
+        "economy": "Economy", "bowling_average": "Bowling Average", "bowling_strike_rate": "Bowling SR",
+        "batting_average": "Batting Average", "batting_strike_rate": "Batting SR", "wickets": "Wickets",
+        "runs": "Runs", "deliveries": "Balls", "dot_pct": "Dot %"
+    }.get(metric, "Runs")
 
 
 def visualise(result: Dict[str, Any], plan: Dict[str, Any]):
-    if plan.get("visualization") == "pitch_map":
+    data = result.get("data")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return
+    vis = plan.get("visualization", "table")
+    metric_col = _metric_column(plan.get("metric", "runs"))
+    if metric_col not in data.columns:
+        metric_col = data.columns[-1]
+
+    if vis == "pitch_map":
         raw = result.get("raw_for_map")
         if isinstance(raw, pd.DataFrame) and {"BounceX", "BounceY"}.issubset(raw.columns):
             plot_df = raw.copy()
             plot_df["Outcome"] = plot_df["Wicket"].map({True: "Wicket", False: "No Wicket"})
             fig = px.scatter(plot_df, x="BounceY", y="BounceX", color="Outcome", hover_data=[c for c in ["BowlerName", "BatsmanName", "Runs", "ReleaseSpeed", "Deviation"] if c in plot_df.columns])
             fig.update_yaxes(autorange="reversed")
-            fig.update_layout(height=500, xaxis_title="BounceY — line (m)", yaxis_title="BounceX — length (m)")
+            fig.update_layout(height=520, xaxis_title="Line — BounceY (m)", yaxis_title="Length — BounceX (m)", margin=dict(l=20,r=20,t=45,b=20))
             st.plotly_chart(fig, use_container_width=True)
-            return
-    data = result.get("data")
-    if not isinstance(data, pd.DataFrame) or data.empty:
         return
-    vis = plan.get("visualization", "table")
-    if vis == "pitch_map" and {"BounceX", "BounceY"}.issubset(data.columns):
-        fig = px.scatter(data, x="BounceY", y="BounceX", color="Wicket", hover_data=[c for c in ["BowlerName", "BatsmanName", "Runs"] if c in data.columns])
-        fig.update_yaxes(autorange="reversed")
-        fig.update_layout(height=500, xaxis_title="BounceY — line (m)", yaxis_title="BounceX — length (m)")
-        st.plotly_chart(fig, use_container_width=True)
-    elif vis == "bar":
+
+    if vis == "bar":
         label = data.columns[0]
-        metric = plan.get("metric")
-        preferred = {
-            "economy": "Economy", "bowling_average": "Bowling Average", "bowling_strike_rate": "Bowling SR",
-            "batting_average": "Batting Average", "batting_strike_rate": "Batting SR", "wickets": "Wickets",
-            "runs": "Runs", "deliveries": "Balls", "dot_pct": "Dot %"
-        }.get(metric)
-        y = preferred if preferred in data.columns else ("Wickets" if "Wickets" in data.columns else data.columns[-1])
-        fig = px.bar(data, x=label, y=y, text_auto=True)
-        fig.update_layout(height=390, margin=dict(l=20,r=20,t=35,b=20))
+        chart = data.copy()
+        chart = chart.sort_values(metric_col, ascending=not bool(plan.get("sort_desc", True)), na_position="last")
+        fig = px.bar(chart, x=metric_col, y=label, orientation="h", text=metric_col,
+                     hover_data=[c for c in ["Balls", "Runs", "Wickets", "Batting SR", "Dot %"] if c in chart.columns])
+        fig.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+        fig.update_layout(height=max(420, min(700, 70 + len(chart) * 42)), margin=dict(l=20,r=50,t=45,b=20),
+                          xaxis_title=metric_col, yaxis_title="", showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
-    elif vis == "line" and "Year" in data.columns:
-        y = plan.get("metric") or "Runs"
-        ymap = {"runs":"Runs","wickets":"Wickets","economy":"Economy","batting_strike_rate":"Batting SR"}
-        y = ymap.get(y, y)
-        if y in data.columns:
-            fig = px.line(data, x="Year", y=y, markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+
+        if "Balls" in chart.columns:
+            st.caption("Sample size is shown in the evidence table; rankings are sorted by the requested metric, not by sample size.")
+        return
+
+    if vis == "line" and "Year" in data.columns:
+        y = metric_col
+        fig = px.line(data, x="Year", y=y, markers=True, text=y)
+        fig.update_layout(height=430, margin=dict(l=20,r=20,t=45,b=20), yaxis_title=y)
+        st.plotly_chart(fig, use_container_width=True)
 
 
 # ---------------- PAGE ----------------
@@ -352,7 +427,7 @@ with c1:
     st.markdown('<div class="dansh-title">DANsh AI</div>', unsafe_allow_html=True)
     st.markdown('<div class="dansh-sub">Hawk-Eye Cricket Intelligence · AI plans · Python calculates · AI interprets</div>', unsafe_allow_html=True)
 with c2:
-    st.markdown(f'<div style="text-align:right;margin-top:15px"><span class="orange">{format_banner_caps(cfg)}</span><br>{len(df):,} deliveries</div>', unsafe_allow_html=True)
+    st.markdown(f'<div style="text-align:right;margin-top:15px"><span class="orange">{format_banner_caps(cfg)}</span><br><span style="color:#64748B;font-size:.9rem">Dataset: {len(df):,} deliveries</span></div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("DANsh Controls")
@@ -409,9 +484,13 @@ with st.expander("Example questions", expanded=False):
     st.write(" · ".join(examples))
 
 if ask and question.strip():
-    with st.spinner("DANsh is planning the analysis…"):
+    with st.spinner("DANsh is building the analysis plan…"):
         try:
-            if api_key:
+            # Ranking/leaderboard questions are deterministic enough to compile locally.
+            # This avoids wasting provider tokens on a plan that Python can express exactly.
+            if is_simple_ranking_query(question):
+                plan = fallback_plan(question, df)
+            elif api_key:
                 planner_catalog = dataset_catalog(df, question)
                 planner_text = call_ai(build_planner_prompt(question, planner_catalog, cfg, speed_unit), api_key, provider=provider, model=model)
                 plan = parse_json(planner_text)
@@ -427,6 +506,17 @@ if ask and question.strip():
         explicit_filters = infer_explicit_filters(question, df)
         for key, value in explicit_filters.items():
             filters[key] = value
+
+        # Explicit ranking language is deterministic: never let the model rank by sample size.
+        if is_simple_ranking_query(question):
+            ranking = infer_ranking_intent(question, plan.get("role", "auto"))
+            plan["metric"] = ranking["metric"]
+            plan["group_by"] = ranking["group_by"]
+            plan["top_n"] = ranking["top_n"]
+            plan["sort_desc"] = ranking["sort_desc"]
+            plan["visualization"] = "bar"
+            if plan.get("role") in (None, "auto"):
+                plan["role"] = "bowler" if ranking["group_by"] == "bowler" else "batter"
 
         if filters.get("bowler"):
             filters["bowler"] = resolve_subject_name(str(filters["bowler"]), df["BowlerName"].unique().tolist()) or filters["bowler"]
@@ -448,16 +538,68 @@ if ask and question.strip():
         st.json(plan)
         st.stop()
 
-    st.markdown("### Analysis")
+    st.markdown("### DANsh Result")
+    st.caption("Clean answer · deterministic cricket calculations · AI interpretation")
+
+    # Human-readable query summary before any technical details.
+    pf = plan.get("filters") or {}
+    chips = []
+    for key, label in [("batter", "Batter"), ("bowler", "Bowler"), ("year", "Year"), ("delivery_type", "Bowling type"), ("batter_hand", "Batter hand"), ("pitch_length", "Pitch length"), ("phase", "Phase")]:
+        if pf.get(key) not in (None, "", "All"):
+            chips.append(f"**{label}:** {pf[key]}")
+    if chips:
+        st.info(" · ".join(chips))
+
+    if plan.get("group_by") and plan.get("metric"):
+        direction = "highest first" if plan.get("sort_desc", True) else "lowest first"
+        metric_label = _metric_column(plan.get("metric"))
+        st.caption(f"Ranking: **{metric_label}** · {direction} · Top {plan.get('top_n', 10)}")
+
+    m = result["metrics"]
+    metric_key = str(plan.get("metric") or "runs")
+    metric_label = _metric_column(metric_key)
+    metric_value = m.get(metric_key)
+    if metric_value is None:
+        metric_value = m.get(metric_label.lower().replace(" ", "_"))
+    if isinstance(metric_value, (int, float)) and pd.notna(metric_value):
+        metric_display = f"{metric_value:,.2f}" if metric_key not in {"runs", "wickets", "deliveries"} else f"{metric_value:,.0f}"
+    else:
+        metric_display = "—"
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("QUALIFYING DELIVERIES", f"{result['rows']:,}")
+    k2.metric(metric_label.upper(), metric_display)
+    k3.metric("RUNS", f"{m.get('runs',0):,.0f}")
+    k4.metric("CONFIDENCE", f"{result['confidence']['score']}%")
+
+    if result["confidence"]["sample"] < int(min_sample):
+        st.warning(f"Very less sample size: {result['confidence']['sample']:,} deliveries. Treat the conclusion cautiously.")
+
+    if isinstance(result.get("data"), pd.DataFrame):
+        st.markdown("#### Visualisation")
+        visualise(result, plan)
+        st.markdown("#### Top results")
+        display_df = result["data"].copy()
+        if str(plan.get("role")) == "batter":
+            preferred_cols = ["Rank", "BatsmanName", "Balls", "Runs", "Batting SR", "Batting Average", "Dot %", "Boundary %"]
+        elif str(plan.get("role")) == "bowler":
+            preferred_cols = ["Rank", "BowlerName", "Balls", "Runs", "Wickets", "Economy", "Bowling SR", "Dot %"]
+        else:
+            preferred_cols = ["Rank", "BatsmanName", "BowlerName", "Balls", "Runs", "Batting SR", "Economy", "Wickets"]
+        display_cols = [c for c in preferred_cols if c in display_df.columns]
+        st.dataframe(display_df[display_cols], use_container_width=True, hide_index=True)
+
+    # AI narrative comes after the deterministic evidence, so the user sees exactly what was measured first.
+    st.markdown("#### Key insight")
     if api_key:
         with st.spinner(f"{provider} is interpreting the calculated evidence…"):
             try:
                 interpretation_prompt = f"""
 You are DANsh, a senior cricket analyst. Python has already calculated the evidence below.
-Do not recalculate or invent numbers. Explain what the evidence means.
-Separate observed facts from analytical inference. Give a confidence meter and mention sample size.
-If the sample is small, explicitly say so. For tactical recommendations, make them evidence-led and clearly label them as recommendations.
-Use concise professional cricket-analyst language. The user asked:
+Do not recalculate or invent numbers. Explain the ranking/result in concise professional cricket-analyst language.
+Start with one clear takeaway. Then give at most 3 short evidence-backed observations. Mention sample-size limitations in one sentence.
+Do not output a markdown table. Do not repeat every row. Do not give tactical recommendations unless the user explicitly asks for recommendations. Keep the answer under 120 words.
+
+USER QUESTION:
 {question}
 
 CALCULATED EVIDENCE:
@@ -467,28 +609,14 @@ CALCULATED EVIDENCE:
                 st.markdown('<div class="ai-card">' + answer.replace("\n", "<br>") + '</div>', unsafe_allow_html=True)
             except Exception as e:
                 st.warning(f"AI interpretation failed: {e}")
-                st.info("The deterministic calculation is still shown below.")
+                st.info("The deterministic calculation and visualisation are still shown above.")
     else:
-        st.info("No AI API key configured. Showing deterministic analysis; add the selected provider key to enable AI planning and interpretation.")
+        st.info("No AI API key configured. The deterministic calculation and visualisation above are complete; add the selected provider key only if you want the AI narrative.")
 
-    m = result["metrics"]
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("DELIVERIES", f"{result['rows']:,}")
-    k2.metric("RUNS", f"{m.get('runs',0):,.0f}")
-    k3.metric("WICKETS", f"{m.get('wickets',0):,}")
-    k4.metric("ECONOMY", "—" if m.get('economy') is None else f"{m['economy']:.2f}")
-    k5.metric("CONFIDENCE", f"{result['confidence']['score']}%")
-
-    if result["confidence"]["sample"] < int(min_sample):
-        st.warning(f"Very less sample size: {result['confidence']['sample']:,} deliveries. Treat the conclusion cautiously.")
-
-    st.markdown("#### Calculation plan")
-    st.json(plan)
-
-    if isinstance(result.get("data"), pd.DataFrame):
-        st.markdown("#### Evidence")
-        st.dataframe(result["data"], use_container_width=True, hide_index=True)
-        visualise(result, plan)
+    with st.expander("Advanced details", expanded=False):
+        st.caption("Technical plan and analytical rules are kept here so the main answer stays concise.")
+        st.markdown("**How DANsh interpreted the question**")
+        st.json(plan)
 
     with st.expander("Data quality / analytical rules", expanded=False):
         st.write({
