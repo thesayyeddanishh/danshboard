@@ -1,17 +1,38 @@
-Dashboard Link: https://danshboard.streamlit.app/
+# DANsh AI — Page 5
 
+DANsh is the Hawk-Eye cricket intelligence layer for the Streamlit dashboard.
 
-## DANsh AI (Page 5)
+## AI providers
 
-Page 5 adds a natural-language Hawk-Eye analysis layer. The architecture is:
+DANsh supports both providers from the Page 5 sidebar:
 
-**Grok plans → Python calculates → Grok interprets.**
+- **Grok / xAI** — `grok-4.7`, using xAI's Responses API.
+- **Groq** — `openai/gpt-oss-120b` or `openai/gpt-oss-20b`, using Groq's OpenAI-compatible Responses API.
 
-The page uses the existing `cricket_config.py` format and pitch rules and includes the agreed Hawk-Eye semantics such as BounceX filtering, Medium → Seam, interception `-999.9` as no contact, and InterceptionX measured from the center of the pitch.
+Configure the provider key in Streamlit secrets or environment variables:
 
-### xAI API key
+```toml
+XAI_API_KEY = "your-xai-key"
+GROQ_API_KEY = "your-groq-key"
+```
 
-Set `XAI_API_KEY` as an environment variable or Streamlit secret. The page uses the xAI Responses API with `grok-4.7`. Without a key, a deterministic local fallback planner still lets the page demonstrate the calculation engine.
+You can keep both keys configured and switch providers from the DANsh sidebar without changing code.
 
-### xAI API note
-DANsh uses the canonical xAI Responses API role/content input format. If xAI rejects a request, the page now shows the actual API error payload instead of only `400 Client Error`.
+## Architecture
+
+**Selected AI provider plans → Python calculates → selected AI provider interprets**
+
+All critical cricket calculations are performed locally from the uploaded Hawk-Eye dataset. The AI provider is not trusted to calculate the numerical results.
+
+## Locked Hawk-Eye rules
+
+- BounceX analytical range: `-10` to `+18` metres.
+- BounceX = `0` at the base of middle stump at the batting end.
+- InterceptionX is measured from the **center of the pitch**.
+- InterceptionY is relative to the middle-stump line.
+- Interception `-999.9` means no bat/pad/body contact.
+- ReleaseSpeed analytical range: `40` to `150`.
+- Swing = pre-bounce lateral movement.
+- Deviation = post-bounce lateral movement; analytical range `-15` to `+15` degrees.
+- Medium deliveries are treated as Seam.
+- Existing pitch bins, phase logic and dashboard formulas are inherited from the project's analytical configuration.
