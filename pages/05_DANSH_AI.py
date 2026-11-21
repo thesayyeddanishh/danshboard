@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import plotly.express as px
@@ -82,7 +82,7 @@ def call_ai(prompt: str, api_key: str, *, provider: str, model: str) -> str:
         ],
         "temperature": 0.7,
         "top_p": 0.95,
-        "max_output_tokens": 5000,
+        "max_output_tokens": 1800,
     }
 
     try:
@@ -120,53 +120,113 @@ def parse_json(text: str) -> Dict[str, Any]:
         return json.loads(m.group(0))
 
 
-def dataset_catalog(df: pd.DataFrame) -> Dict[str, Any]:
-    def vals(c, n=250):
+def _norm_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()).upper()
+
+
+def _matching_names(question: str, values: List[str], limit: int = 8) -> List[str]:
+    """Return only names that are explicitly present in the user's question."""
+    q = _norm_text(question)
+    unique = sorted({_norm_text(v) for v in values if str(v).strip()}, key=lambda x: (-len(x), x))
+    return [v for v in unique if v and v in q][:limit]
+
+
+def dataset_catalog(df: pd.DataFrame, question: str = "") -> Dict[str, Any]:
+    """Build a compact planner catalog. Never send the full player/match catalog to the LLM."""
+    def vals(c, n=25):
         if c not in df.columns:
             return []
-        return sorted(df[c].dropna().astype(str).unique().tolist())[:n]
+        out = sorted({_norm_text(v) for v in df[c].dropna().tolist() if str(v).strip()})
+        return out[:n]
+
+    batters = df["BatsmanName"].dropna().astype(str).tolist() if "BatsmanName" in df.columns else []
+    bowlers = df["BowlerName"].dropna().astype(str).tolist() if "BowlerName" in df.columns else []
+
     return {
-        "rows": len(df),
-        "columns": list(df.columns),
-        "players_bowlers": vals("BowlerName"),
-        "players_batters": vals("BatsmanName"),
-        "grounds": vals("Ground"),
-        "batting_teams": vals("BattingTeam"),
-        "bowling_teams": vals("BowlingTeam"),
-        "tours": vals("Tour"),
-        "matches": vals("Match"),
-        "years": vals("Year"),
-        "delivery_types": vals("DeliveryType"),
+        "rows": int(len(df)),
+        "columns": [c for c in df.columns if c not in {"BounceX", "BounceY", "InterceptionX", "InterceptionY", "InterceptionZ", "CreaseY", "CreaseZ", "StumpsY", "StumpsZ", "ReleaseY", "ReleaseZ", "LandingX", "LandingY"}],
+        "explicit_batter_candidates": _matching_names(question, batters),
+        "explicit_bowler_candidates": _matching_names(question, bowlers),
+        "grounds": vals("Ground", 10),
+        "batting_teams": vals("BattingTeam", 15),
+        "bowling_teams": vals("BowlingTeam", 15),
+        "tours": vals("Tour", 10),
+        "years": vals("Year", 10),
+        "delivery_types": vals("DeliveryType", 5),
     }
 
 
-def build_planner_prompt(question: str, catalog: Dict[str, Any], cfg, speed_unit: str) -> str:
-    return f"""
-You are DANsh, a cricket analytics query planner. You DO NOT calculate statistics.
-You translate the analyst's natural-language question into a deterministic analysis plan for Python.
-Never invent player/team/ground names. Use only values supplied in the catalog when selecting entities.
-The existing dashboard formulas are the source of truth. DeliveryType Medium has already been normalised to Seam.
-BounceX analytical validity is -10 to +18 metres. ReleaseSpeed analytical validity is 40 to 150.
-InterceptionX is measured from the CENTER OF THE PITCH. InterceptionY is from the middle-stump line.
-Interception -999.9 means no contact. Swing is pre-bounce; Deviation is post-bounce. Deviation analytical range is -15 to +15 degrees.
+def infer_explicit_filters(question: str, df: pd.DataFrame) -> Dict[str, Any]:
+    """Extract unambiguous constraints from the question without relying on an LLM."""
+    q = _norm_text(question)
+    filters: Dict[str, Any] = {}
 
-CURRENT FORMAT: {cfg.label}
+    # Year: only accept years that actually exist in the loaded dataset.
+    available_years = set(pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int).tolist()) if "Year" in df.columns else set()
+    year_hits = [int(y) for y in re.findall(r"\b(20\d{2})\b", q) if int(y) in available_years]
+    if year_hits:
+        filters["year"] = year_hits[-1]
+
+    # Delivery type: Medium is analytically Seam by the user's established rule.
+    if re.search(r"\b(SEAM|SEAMER|PACE|PACERS|FAST BOWLING)\b", q):
+        filters["delivery_type"] = "Seam"
+    elif re.search(r"\b(SPIN|SPINNER|SPINNERS)\b", q):
+        filters["delivery_type"] = "Spin"
+
+    batters = df["BatsmanName"].dropna().astype(str).unique().tolist() if "BatsmanName" in df.columns else []
+    bowlers = df["BowlerName"].dropna().astype(str).unique().tolist() if "BowlerName" in df.columns else []
+    batter_hits = _matching_names(question, batters, limit=5)
+    bowler_hits = _matching_names(question, bowlers, limit=5)
+
+    # If the same name is present in both lists, keep the explicit role wording if available.
+    batter_set = set(batter_hits)
+    bowler_set = set(bowler_hits)
+    role_words_bowler = bool(re.search(r"\b(BOWLER|BOWLING|BOWLED|SEAM BOWLER|SPINNER)\b", q))
+    role_words_batter = bool(re.search(r"\b(BATTER|BATSMAN|BATTING|BAT)\b", q))
+
+    if batter_hits and bowler_hits:
+        # Prefer distinct names where the query contains a matchup connector.
+        if re.search(r"\b(VS|VERSUS|AGAINST|MATCHUP|V)\b", q):
+            if len(batter_hits) == 1 and len(bowler_hits) >= 1:
+                filters["batter"] = batter_hits[0]
+                # Avoid assigning the same player as both unless there is no alternative.
+                other = next((n for n in bowler_hits if n != batter_hits[0]), None)
+                if other:
+                    filters["bowler"] = other
+            elif len(bowler_hits) == 1 and len(batter_hits) >= 1:
+                filters["bowler"] = bowler_hits[0]
+                other = next((n for n in batter_hits if n != bowler_hits[0]), None)
+                if other:
+                    filters["batter"] = other
+    elif batter_hits and not role_words_bowler:
+        filters["batter"] = batter_hits[0]
+    elif bowler_hits and role_words_bowler and not role_words_batter:
+        filters["bowler"] = bowler_hits[0]
+    elif batter_hits:
+        filters["batter"] = batter_hits[0]
+
+    return filters
+
+
+def build_planner_prompt(question: str, catalog: Dict[str, Any], cfg, speed_unit: str) -> str:
+    # Keep this prompt deliberately small: Groq's current on-demand TPM limit can be 8k.
+    return f"""You are DANsh, a cricket analytics query planner. Do NOT calculate statistics.
+Translate the user's question into a deterministic Python analysis plan.
+Use only entities in the compact catalog below. If the question contains an explicit player/year/delivery type, preserve those filters exactly.
+Existing dashboard formulas are the source of truth. Medium is Seam. BounceX validity is -10 to +18 m. ReleaseSpeed validity is 40 to 150. InterceptionX is measured from the CENTER OF THE PITCH. Interception -999.9 means no contact. Deviation validity is -15 to +15 degrees.
+
+FORMAT: {cfg.label}
 SPEED UNIT: {speed_unit}
 
-Return ONLY JSON with these keys:
-analysis_type, role, filters, metric, group_by, compare_to_baseline, visualization, top_n, min_sample, user_needs_clarification.
+Return ONLY JSON with keys: analysis_type, role, filters, metric, group_by, compare_to_baseline, visualization, top_n, min_sample, user_needs_clarification.
+analysis_type: metric | strengths | matchup | ground | swot | comparison | trend | discovery | key_matchups | distribution
+role: batter | bowler | both | auto
+filters may contain: bowler, batter, bowling_team, batting_team, ground, tour, match, year, phase, delivery_type, batter_hand, bowler_hand, pitch_length, speed_group, release_side, stump_channel
+group_by: pitch_length | phase | speed_group | release_side | crease_zone | stump_channel | batter_hand | bowler_hand | ground | bowler | batter | batting_team | bowling_team | year | null
+visualization: table | bar | line | scatter | pitch_map | none
 
-analysis_type should be one of:
-metric, strengths, matchup, ground, swot, comparison, trend, discovery, key_matchups, distribution.
-role should be one of: batter, bowler, both, auto.
-filters is an object with optional keys: bowler, batter, bowling_team, batting_team, ground, tour, match, year, phase, delivery_type, batter_hand, bowler_hand, pitch_length, speed_group, release_side, stump_channel.
-metric may be: economy, bowling_average, bowling_strike_rate, batting_average, batting_strike_rate, wickets, runs, deliveries, dot_pct, boundary_pct, avg_speed, avg_swing, avg_deviation, avg_length, hitting_stumps_pct.
-group_by may be one of: pitch_length, phase, speed_group, release_side, crease_zone, stump_channel, batter_hand, bowler_hand, ground, bowler, batter, batting_team, bowling_team, year, or null.
-visualization may be: table, bar, line, scatter, pitch_map, none.
-compare_to_baseline is true when the question asks whether something is better/worse/stronger than normal.
-
-CATALOG:
-{json.dumps(catalog, ensure_ascii=False)}
+COMPACT CATALOG:
+{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}
 
 QUESTION:
 {question}
@@ -175,17 +235,24 @@ QUESTION:
 
 def fallback_plan(question: str, df: pd.DataFrame) -> Dict[str, Any]:
     q = question.lower()
-    role = "bowler" if any(x in q for x in ["bowler", "bowling", "bowled", "pace", "seam bowler", "spinner"]) else "batter" if any(x in q for x in ["batter", "batting", "batsman"]) else "auto"
-    analysis_type = "matchup" if " vs " in q or "versus" in q or "matchup" in q else "ground" if "ground" in q or "venue" in q else "strengths" if "strength" in q else "swot" if "swot" in q else "metric"
+    filters = infer_explicit_filters(question, df)
+    has_batter = bool(filters.get("batter"))
+    has_bowler = bool(filters.get("bowler"))
+    role = "both" if has_batter and has_bowler else "batter" if has_batter else "bowler" if has_bowler else ("bowler" if any(x in q for x in ["bowler", "bowling", "bowled", "seam bowler", "spinner"]) else "batter" if any(x in q for x in ["batter", "batting", "batsman"]) else "auto")
+    analysis_type = "matchup" if has_batter and has_bowler or " vs " in q or "versus" in q or "matchup" in q else "ground" if "ground" in q or "venue" in q else "strengths" if "strength" in q else "swot" if "swot" in q else "metric"
     metric = "wickets" if "wicket" in q else "economy" if "economy" in q else "batting_strike_rate" if "strike rate" in q and role == "batter" else "bowling_strike_rate" if "strike rate" in q else "runs"
     return {
-        "analysis_type": analysis_type, "role": role, "filters": {}, "metric": metric,
+        "analysis_type": analysis_type,
+        "role": role,
+        "filters": filters,
+        "metric": metric,
         "group_by": "pitch_length" if "length" in q else "phase" if "phase" in q or "overs" in q else None,
         "compare_to_baseline": "better" in q or "worse" in q or "strength" in q,
         "visualization": "bar" if "length" in q or "phase" in q else "table",
-        "top_n": 10, "min_sample": 10, "user_needs_clarification": False,
+        "top_n": 10,
+        "min_sample": 10,
+        "user_needs_clarification": False,
     }
-
 
 def run_analysis(df: pd.DataFrame, plan: Dict[str, Any], cfg, speed_unit: str) -> Dict[str, Any]:
     d = filter_plan(df, plan, cfg, speed_unit)
@@ -283,7 +350,7 @@ df = add_derived_columns(raw, cfg, speed_unit)
 c1, c2 = st.columns([3.2, 1.2])
 with c1:
     st.markdown('<div class="dansh-title">DANsh AI</div>', unsafe_allow_html=True)
-    st.markdown('<div class="dansh-sub">Hawk-Eye Cricket Intelligence · Grok plans · Python calculates · Grok interprets</div>', unsafe_allow_html=True)
+    st.markdown('<div class="dansh-sub">Hawk-Eye Cricket Intelligence · AI plans · Python calculates · AI interprets</div>', unsafe_allow_html=True)
 with c2:
     st.markdown(f'<div style="text-align:right;margin-top:15px"><span class="orange">{format_banner_caps(cfg)}</span><br>{len(df):,} deliveries</div>', unsafe_allow_html=True)
 
@@ -345,7 +412,8 @@ if ask and question.strip():
     with st.spinner("DANsh is planning the analysis…"):
         try:
             if api_key:
-                planner_text = call_ai(build_planner_prompt(question, dataset_catalog(df), cfg, speed_unit), api_key, provider=provider, model=model)
+                planner_catalog = dataset_catalog(df, question)
+                planner_text = call_ai(build_planner_prompt(question, planner_catalog, cfg, speed_unit), api_key, provider=provider, model=model)
                 plan = parse_json(planner_text)
             else:
                 plan = fallback_plan(question, df)
@@ -353,12 +421,25 @@ if ask and question.strip():
             st.warning(f"AI planning failed, so DANsh used the local fallback planner: {e}")
             plan = fallback_plan(question, df)
 
-        # Resolve explicit names deterministically against the actual dataset.
+        # Deterministic guardrail: explicit constraints in the user's question always win.
+        # This prevents an AI failure or incomplete plan from silently reverting to the full dataset.
         filters = plan.setdefault("filters", {})
+        explicit_filters = infer_explicit_filters(question, df)
+        for key, value in explicit_filters.items():
+            filters[key] = value
+
         if filters.get("bowler"):
             filters["bowler"] = resolve_subject_name(str(filters["bowler"]), df["BowlerName"].unique().tolist()) or filters["bowler"]
         if filters.get("batter"):
             filters["batter"] = resolve_subject_name(str(filters["batter"]), df["BatsmanName"].unique().tolist()) or filters["batter"]
+
+        # Keep the role consistent with explicit player constraints.
+        if filters.get("batter") and filters.get("bowler"):
+            plan["role"] = "both"
+        elif filters.get("batter"):
+            plan["role"] = "batter"
+        elif filters.get("bowler"):
+            plan["role"] = "bowler"
 
         result = run_analysis(df, plan, cfg, speed_unit)
 
@@ -369,7 +450,7 @@ if ask and question.strip():
 
     st.markdown("### Analysis")
     if api_key:
-        with st.spinner("Grok is interpreting the calculated evidence…"):
+        with st.spinner(f"{provider} is interpreting the calculated evidence…"):
             try:
                 interpretation_prompt = f"""
 You are DANsh, a senior cricket analyst. Python has already calculated the evidence below.
