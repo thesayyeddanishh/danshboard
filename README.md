@@ -36,3 +36,10 @@ All critical cricket calculations are performed locally from the uploaded Hawk-E
 - Deviation = post-bounce lateral movement; analytical range `-15` to `+15` degrees.
 - Medium deliveries are treated as Seam.
 - Existing pitch bins, phase logic and dashboard formulas are inherited from the project's analytical configuration.
+
+
+## v4 request-size protection
+
+The planner no longer sends the full player/match catalog to the AI provider. It sends only compact metadata plus question-matched entity candidates. Explicit player, year, team, ground and Seam/Spin filters are also extracted deterministically before analysis. This prevents a failed AI planning request from silently analysing the entire dataset.
+
+Planner and interpretation output budgets are kept separate to reduce provider TPM pressure.
