@@ -163,8 +163,10 @@ def infer_explicit_filters(question: str, df: pd.DataFrame) -> Dict[str, Any]:
     q = _norm_text(question)
     filters: Dict[str, Any] = {}
 
-    available_years = set(pd.to_numeric(df["Year"], errors="coerce").dropna().astype(int).tolist()) if "Year" in df.columns else set()
-    year_hits = [int(y) for y in re.findall(r"\b(20\d{2})\b", q) if int(y) in available_years]
+    # An explicit year is a hard user constraint even when that year is absent
+    # from the loaded dataset.  In that case the deterministic filter must yield
+    # zero rows rather than silently analysing every available season.
+    year_hits = [int(y) for y in re.findall(r"\b(20\d{2})\b", q)]
     if year_hits:
         filters["year"] = year_hits[-1]
 
@@ -328,7 +330,19 @@ def run_analysis(df: pd.DataFrame, plan: Dict[str, Any], cfg, speed_unit: str) -
     if plan.get("analysis_type") in {"matchup", "key_matchups"} and not group_by:
         result["data"] = matchup_analysis(d, int(plan.get("top_n") or 15))
     elif group_by:
-        g = group_analysis(d, group_by, role, int(plan.get("top_n") or 10), metric=str(plan.get("metric") or "runs"), sort_desc=bool(plan.get("sort_desc", True)))
+        # v8 requires the metric/sort-aware group_analysis implementation.
+        # Keep the failure explicit rather than exposing a Streamlit traceback.
+        try:
+            g = group_analysis(
+                d, group_by, role, int(plan.get("top_n") or 10),
+                metric=str(plan.get("metric") or "runs"),
+                sort_desc=bool(plan.get("sort_desc", True)),
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "DANsh engine version mismatch: pages/05_DANSH_AI.py requires "
+                "the metric-aware dansh_engine.py from this build. Replace both files."
+            ) from exc
         result["data"] = g
     else:
         result["data"] = pd.DataFrame([result["metrics"]])
@@ -531,7 +545,15 @@ if ask and question.strip():
         elif filters.get("bowler"):
             plan["role"] = "bowler"
 
-        result = run_analysis(df, plan, cfg, speed_unit)
+        try:
+            result = run_analysis(df, plan, cfg, speed_unit)
+        except Exception as exc:
+            st.error(
+                "DANsh could not complete this analysis. This usually means the Page 5 "
+                "and dansh_engine.py versions are out of sync. Replace BOTH files from "
+                "the v8 build and redeploy. Details: " + str(exc)
+            )
+            st.stop()
 
     if result["rows"] == 0:
         st.error("No deliveries matched the requested analysis. Try widening the filters or specifying the format/context.")
