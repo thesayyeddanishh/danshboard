@@ -259,7 +259,7 @@ def metrics(df: pd.DataFrame, role: str = "auto") -> Dict[str, Any]:
     return out
 
 
-def group_analysis(df: pd.DataFrame, group_by: str, role: str, top_n: int = 10) -> pd.DataFrame:
+def group_analysis(df: pd.DataFrame, group_by: str, role: str, top_n: int = 10, metric: str = "runs", sort_desc: bool = True) -> pd.DataFrame:
     mapping = {
         "pitch_length": "PitchLength", "phase": "Phase", "speed_group": "SpeedGroup",
         "release_side": "ReleaseSide", "crease_zone": "CreaseZone", "stump_channel": "StumpChannel",
@@ -279,9 +279,29 @@ def group_analysis(df: pd.DataFrame, group_by: str, role: str, top_n: int = 10) 
     g["Bowling SR"] = np.where(g["Wickets"] > 0, g["Balls"] / g["Wickets"], np.nan)
     g["Batting SR"] = np.where(g["Balls"] > 0, g["Runs"] / g["Balls"] * 100, np.nan)
     g["Batting Average"] = np.where(g["Wickets"] > 0, g["Runs"] / g["Wickets"], np.nan)
-    dot = df.groupby(col)["Runs"].apply(lambda s: (s == 0).mean() * 100)
+    dot = df.groupby(col, dropna=False)["Runs"].apply(lambda s: (s == 0).mean() * 100)
     g["Dot %"] = g[col].map(dot)
-    return g.sort_values("Balls", ascending=False).head(top_n)
+    boundary = df.groupby(col, dropna=False)["Runs"].apply(lambda s: s.isin([4, 6]).mean() * 100)
+    g["Boundary %"] = g[col].map(boundary)
+
+    metric_col = {
+        "economy": "Economy", "bowling_average": "Bowling Average", "bowling_strike_rate": "Bowling SR",
+        "batting_average": "Batting Average", "batting_strike_rate": "Batting SR", "wickets": "Wickets",
+        "runs": "Runs", "deliveries": "Balls", "dot_pct": "Dot %", "boundary_pct": "Boundary %"
+    }.get(metric, "Runs")
+    if metric_col not in g.columns:
+        metric_col = "Runs"
+    # Deterministic ranking: requested metric first, then sample size, then name.
+    # This prevents pandas' group order from changing the visible Top-N ranking.
+    g["_GroupLabel"] = g[col].astype(str)
+    g = g.sort_values(
+        [metric_col, "Balls", "_GroupLabel"],
+        ascending=[not sort_desc, False, True],
+        na_position="last",
+    )
+    g["Rank"] = range(1, len(g) + 1)
+    g = g.head(top_n).reset_index(drop=True)
+    return g.drop(columns=["_GroupLabel"], errors="ignore")
 
 
 
