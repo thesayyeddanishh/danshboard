@@ -62,3 +62,12 @@ Planner and interpretation output budgets are kept separate to reduce provider T
 - Ranking results use a horizontal bar chart plus a readable evidence table.
 - Raw delivery rows are never sent to the AI interpretation step; only compact calculated evidence is sent.
 - The result page shows applied filters, ranking direction, sample size, visualisation, evidence, then AI interpretation.
+
+
+## DANsh v8 deployment note
+
+For the metric-aware ranking engine, deploy these two files together:
+- `pages/05_DANSH_AI.py`
+- `dansh_engine.py`
+
+Do not mix the v8 Page 5 with an older `dansh_engine.py`. v8 also treats an explicitly requested year as a hard constraint, so a request for a season not present in the dataset correctly returns no matching deliveries instead of silently dropping the year filter.
